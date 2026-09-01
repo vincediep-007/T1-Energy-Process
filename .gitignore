@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Temporary, cache, and runtime directories
+DailyCache/
+FolderArchives/
+PhoneUploads/
+mes_photos/
+ExcelThumbnails/
+VoiceSamples/
+String Black sample/
+scratch/
+backup/
+*.tmp
+*.log
+
+# Large binary archives
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# SSL certificates and private keys (auto-generated at runtime)
+server.crt
+server.key
+server.pfx
+
+# Diagnostics and runtime floor logs
+last_mes_response.html
+mes_process_trend.json
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Sample & scratch test files
+Def_*.jpg
+SN_*.jpg
+scratch_master_test.xlsx

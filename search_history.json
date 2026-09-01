@@ -1,0 +1,21 @@
+{
+  "history": [
+    {
+      "sn": "V0125C003186705",
+      "station_from": 1001,
+      "station_to": 1014,
+      "days_back": 2,
+      "result_count": 0,
+      "timestamp": "2025-12-26T06:21:17.113213"
+    },
+    {
+      "sn": "V0125C001168791",
+      "station_from": 1001,
+      "station_to": 1014,
+      "days_back": 2,
+      "result_count": 3,
+      "timestamp": "2025-12-25T17:35:35.604660"
+    }
+  ],
+  "last_updated": "2025-12-26T06:21:17.113304"
+}

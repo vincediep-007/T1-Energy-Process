@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mobile Hub Visual Layout Designer</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    /* CSS Variables driven by customizer */
+    :root {
+      --bg-main: #0b132b;
+      --bg-card: #1c2541;
+      --bg-subcard: #24325a;
+      --primary: #3a86ff;
+      --accent-q3: #f59e0b;
+      --accent-scrap: #ef4444;
+      --accent-ok: #10b981;
+      --border-color: #334155;
+      
+      /* Dynamic Customizable Properties */
+      --header-padding: 10px;
+      --tab-btn-padding: 8px;
+      --tab-font-size: 12px;
+      --status-padding: 7px;
+      --status-sn-font: 13px;
+      --status-lbl-font: 9px;
+      --col-class-pct: 44%;
+      --col-summary-pct: 56%;
+      --grid-btn-padding: 11px;
+      --grid-btn-font: 12px;
+      --action-btn-height: 52px;
+      --action-btn-font: 16px;
+      --cam-btn-height: 52px;
+      --cam-title-font: 13px;
+      --cam-sub-font: 9px;
+      --cam-icon-size: 22px;
+      --element-gap: 8px;
+      --border-radius: 10px;
+    }
+
+    /* Live Phone Screen Styles */
+    .phone-container {
+      background: var(--bg-main);
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      height: 720px;
+      overflow: hidden;
+      border-radius: 28px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7), 0 0 0 10px #1e293b;
+      position: relative;
+    }
+
+    .status-summary-bar {
+      display: flex;
+      gap: 6px;
+      margin-bottom: var(--element-gap);
+      flex-shrink: 0;
+    }
+    .status-badge {
+      flex: 1;
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      border: 1px solid var(--border-color);
+      border-radius: var(--border-radius);
+      padding: var(--status-padding) 4px;
+      text-align: center;
+      overflow: hidden;
+    }
+    .badge-lbl {
+      display: block;
+      font-size: var(--status-lbl-font);
+      font-weight: 800;
+      color: #94a3b8;
+      text-transform: uppercase;
+      margin-bottom: 2px;
+    }
+    .status-badge strong {
+      display: block;
+      font-size: var(--status-sn-font);
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .control-grid {
+      display: flex;
+      gap: var(--element-gap);
+      flex: 1;
+      min-height: 140px;
+      margin-bottom: var(--element-gap);
+      overflow: hidden;
+    }
+    .col-panel {
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--border-radius);
+      overflow: hidden;
+    }
+    .col-class { width: var(--col-class-pct); }
+    .col-summary { width: var(--col-summary-pct); }
+
+    .col-header {
+      background: #0f172a;
+      padding: 6px 8px;
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: #94a3b8;
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
+    }
+    .col-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px;
+    }
+
+    .grid-btn {
+      width: 100%;
+      padding: var(--grid-btn-padding) 8px;
+      margin-bottom: 6px;
+      font-size: var(--grid-btn-font);
+      font-weight: 700;
+      text-align: left;
+      background: var(--bg-subcard);
+      color: #e2e8f0;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      cursor: pointer;
+      line-height: 1.25;
+      transition: all 0.15s;
+    }
+    .grid-btn.active-class {
+      background: #2563eb;
+      color: #ffffff;
+      border-color: #60a5fa;
+      box-shadow: 0 2px 10px rgba(37, 99, 235, 0.4);
+    }
+    .grid-btn.active-summary {
+      background: #059669;
+      color: #ffffff;
+      border-color: #34d399;
+      box-shadow: 0 2px 10px rgba(5, 150, 105, 0.4);
+    }
+
+    .action-grid-row {
+      display: flex;
+      gap: var(--element-gap);
+      margin-bottom: var(--element-gap);
+      flex-shrink: 0;
+    }
+    .btn-action {
+      flex: 1;
+      height: var(--action-btn-height);
+      padding: 6px 10px;
+      font-size: var(--action-btn-font);
+      font-weight: 900;
+      border-radius: var(--border-radius);
+      border: 1px solid rgba(255,255,255,0.15);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      text-transform: uppercase;
+      transition: transform 0.1s;
+    }
+    .btn-action:active { transform: scale(0.97); }
+
+    .btn-q3 {
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+      border-color: #fbbf24;
+      color: #000000;
+      box-shadow: 0 4px 12px rgba(245, 158, 11, 0.35);
+    }
+    .btn-scrap {
+      background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+      border-color: #f87171;
+      color: #ffffff;
+      box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
+    }
+
+    .cam-btn-sn {
+      height: var(--cam-btn-height);
+      background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%);
+      border-color: #3b82f6;
+      color: #fff;
+    }
+    .cam-btn-def {
+      height: var(--cam-btn-height);
+      background: linear-gradient(135deg, #581c87 0%, #3b0764 100%);
+      border-color: #a855f7;
+      color: #fff;
+    }
+    .cam-icon { font-size: var(--cam-icon-size); line-height: 1; }
+    .cam-title { font-size: var(--cam-title-font); font-weight: 800; color: #fff; }
+    .cam-sub { font-size: var(--cam-sub-font); font-weight: 600; color: #94a3b8; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 p-4 md:p-6 min-h-screen">
+
+  <div class="max-w-7xl mx-auto">
+    <!-- Header -->
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 pb-4 border-b border-slate-800">
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="text-2xl">📱</span>
+          <h1 class="text-xl md:text-2xl font-black tracking-tight text-white">Mobile Hub Layout & Size Customizer</h1>
+          <span class="bg-blue-500/20 text-blue-400 text-xs font-bold px-2 py-0.5 rounded-full border border-blue-500/30">Live Visual Editor</span>
+        </div>
+        <p class="text-xs md:text-sm text-slate-400 mt-1">Adjust sliders below to customize buttons, columns, and text sizes. The live phone mockup updates in real time.</p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button onclick="resetDefaults()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold border border-slate-700 transition">
+          ↺ Reset Defaults
+        </button>
+        <button onclick="copyCSS()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-blue-500/20 transition flex items-center gap-1.5">
+          <span>📋</span> Copy CSS Code
+        </button>
+        <button onclick="applyToApp()" id="btn-save-app" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-black shadow-lg shadow-emerald-500/20 transition flex items-center gap-1.5">
+          <span>💾</span> Save & Apply to Phone Server
+        </button>
+      </div>
+    </div>
+
+    <!-- Main Grid: Controls Left, Live Preview Right -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+      <!-- LEFT: Slider Controls (7 cols on lg) -->
+      <div class="lg:col-span-7 space-y-4">
+        
+        <!-- Section 1: Top Navigation & Status Banner -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+          <h3 class="text-xs font-black uppercase tracking-wider text-blue-400 mb-3 flex items-center gap-2">
+            <span>🏷️</span> Tier 1 & 2: Status Banner & Navigation
+          </h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Banner Padding:</span>
+                <span id="val-status-padding" class="text-blue-400 font-mono">7px</span>
+              </div>
+              <input type="range" id="input-status-padding" min="3" max="14" value="7" oninput="updateProp('--status-padding', this.value + 'px', 'val-status-padding')" class="w-full accent-blue-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>SN Text Font Size:</span>
+                <span id="val-status-sn-font" class="text-blue-400 font-mono">13px</span>
+              </div>
+              <input type="range" id="input-status-sn-font" min="10" max="18" value="13" oninput="updateProp('--status-sn-font', this.value + 'px', 'val-status-sn-font')" class="w-full accent-blue-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Tab Button Padding:</span>
+                <span id="val-tab-btn-padding" class="text-blue-400 font-mono">8px</span>
+              </div>
+              <input type="range" id="input-tab-btn-padding" min="4" max="14" value="8" oninput="updateProp('--tab-btn-padding', this.value + 'px', 'val-tab-btn-padding')" class="w-full accent-blue-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Element Gap / Spacing:</span>
+                <span id="val-element-gap" class="text-blue-400 font-mono">8px</span>
+              </div>
+              <input type="range" id="input-element-gap" min="3" max="14" value="8" oninput="updateProp('--element-gap', this.value + 'px', 'val-element-gap')" class="w-full accent-blue-500 cursor-pointer">
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 2: 2-Column Middle Defect Picker -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+          <h3 class="text-xs font-black uppercase tracking-wider text-emerald-400 mb-3 flex items-center gap-2">
+            <span>📋</span> Tier 3: 2-Column Defect Picker (Category / Summary)
+          </h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Category Column Width %:</span>
+                <span id="val-col-split" class="text-emerald-400 font-mono">44% / 56%</span>
+              </div>
+              <input type="range" id="input-col-split" min="30" max="60" value="44" oninput="updateColumnSplit(this.value)" class="w-full accent-emerald-500 cursor-pointer">
+              <span class="text-[10px] text-slate-400">Left: Category / Right: Defect Summary</span>
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Category & Defect Button Height (Padding):</span>
+                <span id="val-grid-btn-padding" class="text-emerald-400 font-mono">11px</span>
+              </div>
+              <input type="range" id="input-grid-btn-padding" min="6" max="18" value="11" oninput="updateProp('--grid-btn-padding', this.value + 'px', 'val-grid-btn-padding')" class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Item Text Font Size:</span>
+                <span id="val-grid-btn-font" class="text-emerald-400 font-mono">12px</span>
+              </div>
+              <input type="range" id="input-grid-btn-font" min="10" max="16" value="12" oninput="updateProp('--grid-btn-font', this.value + 'px', 'val-grid-btn-font')" class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Border Radius (Curvature):</span>
+                <span id="val-border-radius" class="text-emerald-400 font-mono">10px</span>
+              </div>
+              <input type="range" id="input-border-radius" min="4" max="18" value="10" oninput="updateProp('--border-radius', this.value + 'px', 'val-border-radius')" class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 3: Bottom Action Buttons (Q3 / Scrap / Barcode / Defect) -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+          <h3 class="text-xs font-black uppercase tracking-wider text-amber-400 mb-3 flex items-center gap-2">
+            <span>⚡</span> Tier 4 & 5: Q3 / SCRAP & Camera Buttons
+          </h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>⚡ Q3 & 💥 SCRAP Height:</span>
+                <span id="val-action-btn-height" class="text-amber-400 font-mono">52px</span>
+              </div>
+              <input type="range" id="input-action-btn-height" min="36" max="75" value="52" oninput="updateProp('--action-btn-height', this.value + 'px', 'val-action-btn-height')" class="w-full accent-amber-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Q3 & SCRAP Font Size:</span>
+                <span id="val-action-btn-font" class="text-amber-400 font-mono">16px</span>
+              </div>
+              <input type="range" id="input-action-btn-font" min="12" max="22" value="16" oninput="updateProp('--action-btn-font', this.value + 'px', 'val-action-btn-font')" class="w-full accent-amber-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>📷 Camera Buttons Height:</span>
+                <span id="val-cam-btn-height" class="text-purple-400 font-mono">52px</span>
+              </div>
+              <input type="range" id="input-cam-btn-height" min="36" max="75" value="52" oninput="updateProp('--cam-btn-height', this.value + 'px', 'val-cam-btn-height')" class="w-full accent-purple-500 cursor-pointer">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs font-semibold text-slate-300 mb-1">
+                <span>Camera Icon & Title Size:</span>
+                <span id="val-cam-title-font" class="text-purple-400 font-mono">13px</span>
+              </div>
+              <input type="range" id="input-cam-title-font" min="11" max="17" value="13" oninput="updateCamFont(this.value)" class="w-full accent-purple-500 cursor-pointer">
+            </div>
+          </div>
+        </div>
+
+        <!-- Phone Screen Mockup Sizer -->
+        <div class="flex items-center justify-between bg-slate-900/60 border border-slate-800 p-3 rounded-lg">
+          <span class="text-xs font-bold text-slate-400">Preview Device Frame Width:</span>
+          <div class="flex gap-2">
+            <button onclick="setPhoneWidth('360px')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-xs rounded font-mono text-slate-300">360px (Compact)</button>
+            <button onclick="setPhoneWidth('390px')" class="px-2.5 py-1 bg-blue-600 text-xs rounded font-mono text-white font-bold">390px (Standard)</button>
+            <button onclick="setPhoneWidth('430px')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-xs rounded font-mono text-slate-300">430px (Pro Max)</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- RIGHT: Interactive Phone Screen Preview (5 cols on lg) -->
+      <div class="lg:col-span-5 flex justify-center items-start">
+        <div id="phone-frame" class="phone-container w-full max-w-[390px]">
+          
+          <!-- Top App Bar -->
+          <div class="bg-[#0f172a] p-3 border-b border-[#334155] sticky top-0 z-10 flex-shrink-0">
+            <div class="flex justify-between items-center mb-2">
+              <div class="font-extrabold text-sm text-white flex items-center gap-1.5">
+                <span>QC Mobile Suite</span>
+              </div>
+              <div class="flex items-center text-[10px] font-bold text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded-full border border-emerald-500/30">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span> LIVE SYNC
+              </div>
+            </div>
+            <div class="flex bg-[#1e293b] rounded-lg p-0.5 gap-1">
+              <button class="flex-1 py-1.5 text-center text-white bg-[#3a86ff] rounded-md font-bold text-xs shadow">
+                ⚡ Defect Control Panel
+              </button>
+              <button class="flex-1 py-1.5 text-center text-slate-400 rounded-md font-bold text-xs">
+                📊 Live Dashboard
+              </button>
+            </div>
+          </div>
+
+          <!-- Main Scrollable Body Area -->
+          <div class="p-2.5 flex-1 flex flex-col overflow-hidden">
+
+            <!-- 1. Status Summary Bar: SN - Defect - Grade -->
+            <div class="status-summary-bar">
+              <div class="status-badge">
+                <span class="badge-lbl">SN</span>
+                <strong class="text-sky-400" id="prev-sn">V01269005050657</strong>
+              </div>
+              <div class="status-badge">
+                <span class="badge-lbl">Defect</span>
+                <strong class="text-emerald-400" id="prev-defect">Crack Cells</strong>
+              </div>
+              <div class="status-badge">
+                <span class="badge-lbl">Grade</span>
+                <strong class="text-amber-400" id="prev-grade">Q3</strong>
+              </div>
+            </div>
+
+            <!-- 2. Two-Column Category & Defect Summary Picker -->
+            <div class="control-grid">
+              <!-- Left Column: Category -->
+              <div class="col-panel col-class">
+                <div class="col-header">1. Category</div>
+                <div class="col-scroll space-y-1">
+                  <button class="grid-btn active-class" onclick="selectClassPreview(this, 'Cells Defect')">Cells Defect</button>
+                  <button class="grid-btn" onclick="selectClassPreview(this, 'Missalignment')">Missalignment</button>
+                  <button class="grid-btn" onclick="selectClassPreview(this, 'Foreign object')">Foreign object</button>
+                  <button class="grid-btn" onclick="selectClassPreview(this, 'Solder Defect')">Solder Defect</button>
+                  <button class="grid-btn" onclick="selectClassPreview(this, 'Bubble Defect')">Bubble Defect</button>
+                  <button class="grid-btn" onclick="selectClassPreview(this, 'Equipment Scrap')">Equipment Scrap</button>
+                </div>
+              </div>
+
+              <!-- Right Column: Defect Summary -->
+              <div class="col-panel col-summary">
+                <div class="col-header">2. Defect Summary</div>
+                <div class="col-scroll space-y-1" id="prev-summary-container">
+                  <button class="grid-btn active-summary" onclick="selectSummaryPreview(this, 'Crack Cells')">Crack Cells</button>
+                  <button class="grid-btn" onclick="selectSummaryPreview(this, 'Cell Defect')">Cell Defect</button>
+                  <button class="grid-btn" onclick="selectSummaryPreview(this, 'Cell color diff')">Cell color diff</button>
+                  <button class="grid-btn" onclick="selectSummaryPreview(this, 'Micro crack')">Micro crack</button>
+                  <button class="grid-btn" onclick="selectSummaryPreview(this, 'Corner crack')">Corner crack</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 3. Q3 and SCRAP Buttons -->
+            <div class="action-grid-row">
+              <button class="btn-action btn-q3" onclick="setGradePreview('Q3')">
+                <span>⚡ Q3</span>
+              </button>
+              <button class="btn-action btn-scrap" onclick="setGradePreview('SCRAP')">
+                <span>💥 SCRAP</span>
+              </button>
+            </div>
+
+            <!-- 4. Defect Photo (1, Left) and Barcode Scan (2, Right) -->
+            <div class="action-grid-row" style="margin-bottom: 0;">
+              <button class="btn-action cam-btn-def" onclick="flashBtn(this)">
+                <span class="cam-icon">📸</span>
+                <div class="text-left overflow-hidden">
+                  <div class="cam-title">1. Defect Photo</div>
+                  <div class="cam-sub">Tap to snap (Zoom)</div>
+                </div>
+              </button>
+              <button class="btn-action cam-btn-sn" onclick="flashBtn(this)">
+                <span class="cam-icon">🏷️</span>
+                <div class="text-left overflow-hidden">
+                  <div class="cam-title">2. Barcode Scan</div>
+                  <div class="cam-sub">Tap to scan SN</div>
+                </div>
+              </button>
+            </div>
+
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast-msg" class="fixed bottom-6 right-6 bg-emerald-600 text-white px-4 py-2.5 rounded-xl font-bold shadow-2xl transition-all duration-300 transform translate-y-20 opacity-0 pointer-events-none z-50 flex items-center gap-2 text-sm">
+      <span id="toast-icon">✅</span> <span id="toast-text">Configuration Copied!</span>
+    </div>
+
+  </div>
+
+  <script>
+    const root = document.documentElement;
+
+    const defaultSettings = {
+      '--status-padding': '7px',
+      '--status-sn-font': '13px',
+      '--status-lbl-font': '9px',
+      '--tab-btn-padding': '8px',
+      '--col-class-pct': '44%',
+      '--col-summary-pct': '56%',
+      '--grid-btn-padding': '11px',
+      '--grid-btn-font': '12px',
+      '--action-btn-height': '52px',
+      '--action-btn-font': '16px',
+      '--cam-btn-height': '52px',
+      '--cam-title-font': '13px',
+      '--cam-sub-font': '9px',
+      '--cam-icon-size': '22px',
+      '--element-gap': '8px',
+      '--border-radius': '10px'
+    };
+
+    function updateProp(propName, value, labelId) {
+      root.style.setProperty(propName, value);
+      if (labelId) {
+        const el = document.getElementById(labelId);
+        if (el) el.innerText = value;
+      }
+    }
+
+    function updateColumnSplit(val) {
+      const classPct = val + '%';
+      const summaryPct = (100 - val) + '%';
+      root.style.setProperty('--col-class-pct', classPct);
+      root.style.setProperty('--col-summary-pct', summaryPct);
+      document.getElementById('val-col-split').innerText = `${classPct} / ${summaryPct}`;
+    }
+
+    function updateCamFont(val) {
+      const titlePx = val + 'px';
+      const subPx = Math.max(8, val - 4) + 'px';
+      const iconPx = (parseInt(val) + 9) + 'px';
+      root.style.setProperty('--cam-title-font', titlePx);
+      root.style.setProperty('--cam-sub-font', subPx);
+      root.style.setProperty('--cam-icon-size', iconPx);
+      document.getElementById('val-cam-title-font').innerText = titlePx;
+    }
+
+    function setPhoneWidth(w) {
+      document.getElementById('phone-frame').style.maxWidth = w;
+    }
+
+    function selectClassPreview(btn, name) {
+      document.querySelectorAll('.col-class .grid-btn').forEach(b => b.classList.remove('active-class'));
+      btn.classList.add('active-class');
+      showToast(`Selected Category: ${name}`);
+    }
+
+    function selectSummaryPreview(btn, name) {
+      document.querySelectorAll('.col-summary .grid-btn').forEach(b => b.classList.remove('active-summary'));
+      btn.classList.add('active-summary');
+      document.getElementById('prev-defect').innerText = name;
+      showToast(`Selected Defect: ${name}`);
+    }
+
+    function setGradePreview(grade) {
+      const el = document.getElementById('prev-grade');
+      el.innerText = grade;
+      el.style.color = (grade === 'SCRAP') ? '#ef4444' : '#f59e0b';
+      showToast(`Evaluation Grade: ${grade}`);
+    }
+
+    function flashBtn(btn) {
+      btn.style.opacity = '0.7';
+      setTimeout(() => btn.style.opacity = '1', 150);
+      showToast('Camera Action Triggered');
+    }
+
+    function resetDefaults() {
+      for (const [key, val] of Object.entries(defaultSettings)) {
+        root.style.setProperty(key, val);
+      }
+      document.getElementById('input-status-padding').value = 7;
+      document.getElementById('val-status-padding').innerText = '7px';
+      document.getElementById('input-status-sn-font').value = 13;
+      document.getElementById('val-status-sn-font').innerText = '13px';
+      document.getElementById('input-tab-btn-padding').value = 8;
+      document.getElementById('val-tab-btn-padding').innerText = '8px';
+      document.getElementById('input-element-gap').value = 8;
+      document.getElementById('val-element-gap').innerText = '8px';
+      document.getElementById('input-col-split').value = 44;
+      document.getElementById('val-col-split').innerText = '44% / 56%';
+      document.getElementById('input-grid-btn-padding').value = 11;
+      document.getElementById('val-grid-btn-padding').innerText = '11px';
+      document.getElementById('input-grid-btn-font').value = 12;
+      document.getElementById('val-grid-btn-font').innerText = '12px';
+      document.getElementById('input-border-radius').value = 10;
+      document.getElementById('val-border-radius').innerText = '10px';
+      document.getElementById('input-action-btn-height').value = 52;
+      document.getElementById('val-action-btn-height').innerText = '52px';
+      document.getElementById('input-action-btn-font').value = 16;
+      document.getElementById('val-action-btn-font').innerText = '16px';
+      document.getElementById('input-cam-btn-height').value = 52;
+      document.getElementById('val-cam-btn-height').innerText = '52px';
+      document.getElementById('input-cam-title-font').value = 13;
+      document.getElementById('val-cam-title-font').innerText = '13px';
+      showToast('Restored Default Dimensions');
+    }
+
+    function getCurrentCSS() {
+      const styles = getComputedStyle(root);
+      return `/* Custom Mobile Hub Dimension Overrides */
+:root {
+  --status-padding: ${styles.getPropertyValue('--status-padding').trim() || '7px'};
+  --status-sn-font: ${styles.getPropertyValue('--status-sn-font').trim() || '13px'};
+  --tab-btn-padding: ${styles.getPropertyValue('--tab-btn-padding').trim() || '8px'};
+  --col-class-pct: ${styles.getPropertyValue('--col-class-pct').trim() || '44%'};
+  --col-summary-pct: ${styles.getPropertyValue('--col-summary-pct').trim() || '56%'};
+  --grid-btn-padding: ${styles.getPropertyValue('--grid-btn-padding').trim() || '11px'};
+  --grid-btn-font: ${styles.getPropertyValue('--grid-btn-font').trim() || '12px'};
+  --action-btn-height: ${styles.getPropertyValue('--action-btn-height').trim() || '52px'};
+  --action-btn-font: ${styles.getPropertyValue('--action-btn-font').trim() || '16px'};
+  --cam-btn-height: ${styles.getPropertyValue('--cam-btn-height').trim() || '52px'};
+  --cam-title-font: ${styles.getPropertyValue('--cam-title-font').trim() || '13px'};
+  --element-gap: ${styles.getPropertyValue('--element-gap').trim() || '8px'};
+  --border-radius: ${styles.getPropertyValue('--border-radius').trim() || '10px'};
+}`;
+    }
+
+    function copyCSS() {
+      const css = getCurrentCSS();
+      navigator.clipboard.writeText(css).then(() => {
+        showToast('CSS Variables copied to clipboard!');
+      }).catch(() => {
+        showToast('Copied settings!');
+      });
+    }
+
+    async function applyToApp() {
+      const btn = document.getElementById('btn-save-app');
+      btn.innerText = '⏳ Saving...';
+      const styles = getComputedStyle(root);
+      const payload = {
+        status_padding: styles.getPropertyValue('--status-padding').trim(),
+        status_sn_font: styles.getPropertyValue('--status-sn-font').trim(),
+        col_class_pct: styles.getPropertyValue('--col-class-pct').trim(),
+        col_summary_pct: styles.getPropertyValue('--col-summary-pct').trim(),
+        grid_btn_padding: styles.getPropertyValue('--grid-btn-padding').trim(),
+        grid_btn_font: styles.getPropertyValue('--grid-btn-font').trim(),
+        action_btn_height: styles.getPropertyValue('--action-btn-height').trim(),
+        action_btn_font: styles.getPropertyValue('--action-btn-font').trim(),
+        cam_btn_height: styles.getPropertyValue('--cam-btn-height').trim(),
+        cam_title_font: styles.getPropertyValue('--cam-title-font').trim(),
+        element_gap: styles.getPropertyValue('--element-gap').trim(),
+        border_radius: styles.getPropertyValue('--border-radius').trim()
+      };
+
+      try {
+        const res = await fetch('/api/save_custom_layout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (res.ok) {
+          btn.innerHTML = '<span>✅</span> Applied to App!';
+          showToast('✅ Saved! Mobile Hub updated live.');
+        } else {
+          btn.innerHTML = '<span>💾</span> Save & Apply';
+          copyCSS();
+          showToast('Applied locally. CSS copied!');
+        }
+      } catch (e) {
+        btn.innerHTML = '<span>💾</span> Save & Apply';
+        copyCSS();
+        showToast('Settings saved & CSS copied to clipboard!');
+      }
+      setTimeout(() => { btn.innerHTML = '<span>💾</span> Save & Apply to Phone Server'; }, 2500);
+    }
+
+    function showToast(text) {
+      const toast = document.getElementById('toast-msg');
+      document.getElementById('toast-text').innerText = text;
+      toast.classList.remove('translate-y-20', 'opacity-0');
+      setTimeout(() => {
+        toast.classList.add('translate-y-20', 'opacity-0');
+      }, 2200);
+    }
+  </script>
+</body>
+</html>

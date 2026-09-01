@@ -1,0 +1,9 @@
+Pillow>=9.0.0
+openpyxl>=3.0.0
+opencv-python>=4.5.0
+pywin32>=300
+pyzbar>=0.1.9
+faster-whisper>=1.0.0
+SpeechRecognition>=3.8.0
+pydub>=0.25.0
+static-ffmpeg>=2.5

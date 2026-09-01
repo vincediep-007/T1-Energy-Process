@@ -1,0 +1,161 @@
+{
+  "DEFECT_TREE": {
+    "Backsheet Defect 背板不良": [
+      "Backsheet Defect",
+      "Backsheet indentation",
+      "Backsheet joint"
+    ],
+    "Bubble Defect 气泡不良": [
+      "Bubble",
+      "No melt"
+    ],
+    "Cells Defect 电池片不良": [
+      "Cell Defect",
+      "Crack Cells",
+      "Cell color difference"
+    ],
+    "EL Defect EL不良": [
+      "EL Defect",
+      "EL broken grid",
+      "EL uneven brightness",
+      "EL shorted cell",
+      "EL cold solder",
+      "EL shaped microcrack"
+    ],
+    "Equipment Scrap 设备报废": [
+      "Equipment Scrap",
+      "Busbar machine Scrap",
+      "Conveyer line scrap",
+      "Edge Trimming machine Scrap",
+      "Fixture machine scrap",
+      "Frame installation machine scrap",
+      "Junction box machine scrap",
+      "Laminator machine scrap",
+      "Power outage Scrap",
+      "Stringing machine scrap"
+    ],
+    "Foreign material Defect 异物不良": [
+      "Foreign material",
+      "Cell fragments",
+      "Desiccant",
+      "Dirty in the module",
+      "EVA label",
+      "EVA seal strip",
+      "Extra Busbar",
+      "Extra ribbon",
+      "Flux crystal",
+      "Glass fragments",
+      "Glass paper",
+      "Insect",
+      "Masking tape",
+      "Paper object",
+      "Positioning tape",
+      "Small label",
+      "Solding balls",
+      "Teflon strip",
+      "sawdust"
+    ],
+    "Glass Defect 玻璃不良": [
+      "Glass Defect",
+      "Glass reversed",
+      "Glass scratches",
+      "Glass raw material",
+      "Glass Missing",
+      "Glass offset"
+    ],
+    "Missalignment Defect 间距不良": [
+      "间距不良 Cell Gap Defect",
+      "String gap Defect",
+      "Cell to Busbar Gap Defect",
+      "Creepage by long ribbons",
+      "Poor creepage distance",
+      "Cells gap defect"
+    ],
+    "Others Defects 其它": [
+      "Others Defects",
+      "Tin exposure on busbar",
+      "Static pattern",
+      "Ribbon Not Cut",
+      "Defect Label",
+      "label offset"
+    ],
+    "Production Scrap 生产报废": [
+      "Production caused Scrap",
+      "Rework causing Scrapped",
+      "Warehousing scrap",
+      "Turnover scrap"
+    ],
+    "Short Circuit Scrap 短路报废": [
+      "Shorted cell scrap",
+      "Cell overlap scrap",
+      "Ribbon overlap scrap",
+      "Busbar misalignment or missing",
+      "Two cell scrap"
+    ],
+    "Solder Defect 焊接不良": [
+      "Solder Defect",
+      "Ribbon offset",
+      "No ribbon",
+      "Busbar Offset"
+    ]
+  },
+  "ACTIVE_LINES": {
+    "TUMZJEL1001": true,
+    "TUMZJEL1002": true,
+    "TUMZJEL1003": false,
+    "TUMZJEL1004": true,
+    "TUMZJEL1005": true,
+    "TUMZJEL1006": true,
+    "TUMZJEL1007": true
+  },
+  "DEFAULT_TIME_INTERVAL": "2 Hours",
+  "CHART_ZOOM_LEVEL": "100%",
+  "DEFAULT_PRE_FINAL_DAYS_BACK_START": 4,
+  "PRE_EL_NETWORK_ROOT": "\\\\10.200.4.19\\filesystem\\PREELPIC\\MV01",
+  "FINAL_EL_MAP": {
+    "TUMZJEL1001": "\\\\10.200.104.1\\elpic\\TUM\\TUMEL1001",
+    "TUMZJEL1002": "\\\\10.200.104.3\\elpic\\TUM\\TUMEL1002",
+    "TUMZJEL1003": "\\\\10.200.104.4\\elpic\\TUM\\TUMEL1003",
+    "TUMZJEL1004": "\\\\10.200.104.5\\elpic\\TUM\\TUMEL1004",
+    "TUMZJEL1005": "\\\\10.200.118.6\\elpic\\TUM\\TUMEL1005",
+    "TUMZJEL1006": "\\\\10.200.118.7\\elpic\\TUM\\TUMEL1006",
+    "TUMZJEL1007": "\\\\10.200.118.9\\elpic\\TUM\\TUMEL1007"
+  },
+  "PRE_EL_STATION_PREFIX": "TUMCQEL",
+  "PRE_EL_STATION_MIN": 1001,
+  "PRE_EL_STATION_MAX": 1014,
+  "MIN_NG_BLACK_PERCENT": 30.0,
+  "PHONE_CAMERA_DIR": "",
+  "PHONE_RECORDINGS_DIR": "",
+  "MASTER_REPORT_PATH": "",
+  "MOBILE_HUD_PORT": 8080,
+  "MAC_MINI_RELAY_URL": "",
+  "MAC_MINI_RELAY_ENABLED": false,
+  "MAC_MINI_RELAY_SECRET": "qc_secret_2026",
+  "MOBILE_LAYOUT_SETTINGS": {
+    "status_padding": "7px",
+    "status_sn_font": "13px",
+    "col_class_pct": "42%",
+    "col_summary_pct": "58%",
+    "grid_btn_padding": "11px",
+    "grid_btn_font": "12px",
+    "action_btn_height": "52px",
+    "action_btn_font": "16px",
+    "cam_btn_height": "52px",
+    "cam_title_font": "13px",
+    "element_gap": "8px",
+    "border_radius": "10px"
+  },
+  "REVIEW_TABLE_COL_WIDTHS": {
+    "date": 100,
+    "sn": 175,
+    "summary": 160,
+    "grade": 80,
+    "pre_el": 210,
+    "mr_pic": 125,
+    "layup_time": 155,
+    "station": 110,
+    "shift": 105,
+    "line": 85
+  }
+}
