@@ -23,10 +23,10 @@ def parse_line_from_station(station_str: str) -> str:
     Final EL (1 station per line):
       - TUMZJEL1001 to TUMZJEL1007 -> Line 1 to Line 7
     """
-    if not station_str or station_str == "-" or "Unknown" in station_str:
-        return "-"
+    if not station_str or str(station_str).strip() in ("", "-", "None", "Unknown"):
+        return ""
 
-    s = station_str.strip().upper()
+    s = str(station_str).strip().upper()
 
     # Direct "Line X" match
     m_line = re.search(r'LINE\s*([1-7])', s)
@@ -38,34 +38,60 @@ def parse_line_from_station(station_str: str) -> str:
     if m_cq:
         st_num = int(m_cq.group(1)) # 1001 to 1014
         st_idx = st_num - 1000      # 1 to 14
-        line_num = max(1, min(7, (st_idx + 1) // 2))
-        return f"Line {line_num}"
+        if 1 <= st_idx <= 14:
+            line_num = max(1, min(7, (st_idx + 1) // 2))
+            return f"Line {line_num}"
 
     # PreEL 1 - PreEL 14
     m_pre = re.search(r'PRE\s*EL\s*(\d+)', s)
     if m_pre:
         st_idx = int(m_pre.group(1))
-        line_num = max(1, min(7, (st_idx + 1) // 2))
-        return f"Line {line_num}"
+        if 1 <= st_idx <= 14:
+            line_num = max(1, min(7, (st_idx + 1) // 2))
+            return f"Line {line_num}"
 
     # Final EL: TUMZJEL1001 - TUMZJEL1007 / TUMEL1001 - TUMEL1007
     m_zj = re.search(r'(?:TUMZJEL|TUMEL)(\d{4})', s)
     if m_zj:
         st_num = int(m_zj.group(1)) # 1001 to 1007
-        line_num = max(1, min(7, st_num - 1000))
-        return f"Line {line_num}"
+        st_idx = st_num - 1000
+        if 1 <= st_idx <= 7:
+            line_num = max(1, min(7, st_idx))
+            return f"Line {line_num}"
 
-    return "Line 1"
+    return ""
 
 
-def get_responsible_shift_and_line(dt: datetime, station_str: str):
+def get_responsible_shift_and_line(dt, station_str: str):
     """
-    Computes Line (e.g. Line 5) and Responsible Shift (A, B, C, or D) from timestamp and station.
+    Computes Line (e.g. Line 5) based on station string,
+    and Responsible Shift (A, B, C, or D) corresponding to the layup time dt.
+    If no station info -> Line is blank ("").
+    If no layup time dt -> Shift is blank ("").
     """
-    # 1. Line Calculation
+    # 1. Line Calculation from station
     line_str = parse_line_from_station(station_str)
 
-    # 2. Shift Timing (06:00 to 18:00 Day, 18:00 to 06:00 Night)
+    # 2. Responsible Shift Calculation (strictly corresponding to layup time dt)
+    if dt is None:
+        return line_str, ""
+
+    if isinstance(dt, str):
+        dt_str = dt.strip()
+        if not dt_str or dt_str in ("", "-", "None", "Unknown"):
+            return line_str, ""
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(dt_str, fmt)
+                break
+            except ValueError:
+                pass
+        if not parsed:
+            return line_str, ""
+        dt = parsed
+
+    # 3. Shift Timing (06:00 to 18:00 Day, 18:00 to 06:00 Night)
     # If between 00:00 and 05:59:59, it belongs to the previous calendar day's night shift
     cal_date = dt.date()
     hour = dt.hour
@@ -78,7 +104,7 @@ def get_responsible_shift_and_line(dt: datetime, station_str: str):
     else:
         is_day = False
 
-    # 3. Bi-Weekly 14-Day Cycle Lookup
+    # 4. Bi-Weekly 14-Day Cycle Lookup
     days_from_epoch = (cal_date - EPOCH_SUNDAY).days
     cycle_day = days_from_epoch % 14  # 0 to 13
 

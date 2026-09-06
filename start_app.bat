@@ -1,5 +1,6 @@
 @echo off
 title AOI & EL Dashboard - QC Defect Suite
+cd /d "%~dp0"
 echo ===================================================
 echo   Starting AOI & EL Dashboard v18.6 ...
 echo ===================================================

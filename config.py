@@ -117,12 +117,42 @@ DEFECT_TREE = {
     "Solder Defect": ["Solder Defect", "Ribbon offset", "No ribbon", "Busbar Offset"]
 }
 
-# Phone Link & Mac Mini Relay Settings
+# Phone Link, Mobile HUD & Mac Mini Relay Settings
 PHONE_CAMERA_DIR = ""
 PHONE_RECORDINGS_DIR = ""
+MASTER_REPORT_PATH = ""
+MOBILE_HUD_PORT = 8080
 MAC_MINI_RELAY_URL = ""
 MAC_MINI_RELAY_ENABLED = False
 MAC_MINI_RELAY_SECRET = "qc_secret_2026"
+
+MOBILE_LAYOUT_SETTINGS = {
+    "status_padding": "7px",
+    "status_sn_font": "13px",
+    "col_class_pct": "44%",
+    "col_summary_pct": "56%",
+    "grid_btn_padding": "11px",
+    "grid_btn_font": "12px",
+    "action_btn_height": "52px",
+    "action_btn_font": "16px",
+    "cam_btn_height": "52px",
+    "cam_title_font": "13px",
+    "element_gap": "8px",
+    "border_radius": "10px"
+}
+
+REVIEW_TABLE_COL_WIDTHS = {
+    "date": 100,
+    "sn": 175,
+    "summary": 160,
+    "grade": 80,
+    "pre_el": 210,
+    "mr_pic": 125,
+    "layup_time": 155,
+    "station": 110,
+    "shift": 105,
+    "line": 85
+}
 
 SETTINGS_FILE = os.path.join(LOCAL_DATA_DIR, "persistent_settings.json")
 HISTORY_FILE = os.path.join(LOCAL_DATA_DIR, "history_records.json")
@@ -143,9 +173,13 @@ def save_persistent_settings():
             "MIN_NG_BLACK_PERCENT": MIN_NG_BLACK_PERCENT,
             "PHONE_CAMERA_DIR": PHONE_CAMERA_DIR,
             "PHONE_RECORDINGS_DIR": PHONE_RECORDINGS_DIR,
+            "MASTER_REPORT_PATH": MASTER_REPORT_PATH,
+            "MOBILE_HUD_PORT": MOBILE_HUD_PORT,
             "MAC_MINI_RELAY_URL": MAC_MINI_RELAY_URL,
             "MAC_MINI_RELAY_ENABLED": MAC_MINI_RELAY_ENABLED,
-            "MAC_MINI_RELAY_SECRET": MAC_MINI_RELAY_SECRET
+            "MAC_MINI_RELAY_SECRET": MAC_MINI_RELAY_SECRET,
+            "MOBILE_LAYOUT_SETTINGS": MOBILE_LAYOUT_SETTINGS,
+            "REVIEW_TABLE_COL_WIDTHS": REVIEW_TABLE_COL_WIDTHS
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -156,7 +190,9 @@ def load_persistent_settings():
     global DEFECT_TREE, ACTIVE_LINES, DEFAULT_TIME_INTERVAL, CHART_ZOOM_LEVEL
     global DEFAULT_PRE_FINAL_DAYS_BACK_START, PRE_EL_NETWORK_ROOT, FINAL_EL_MAP
     global PRE_EL_STATION_PREFIX, PRE_EL_STATION_MIN, PRE_EL_STATION_MAX, MIN_NG_BLACK_PERCENT
-    global PHONE_CAMERA_DIR, PHONE_RECORDINGS_DIR, MAC_MINI_RELAY_URL, MAC_MINI_RELAY_ENABLED, MAC_MINI_RELAY_SECRET
+    global PHONE_CAMERA_DIR, PHONE_RECORDINGS_DIR, MASTER_REPORT_PATH, MOBILE_HUD_PORT
+    global MAC_MINI_RELAY_URL, MAC_MINI_RELAY_ENABLED, MAC_MINI_RELAY_SECRET, MOBILE_LAYOUT_SETTINGS
+    global REVIEW_TABLE_COL_WIDTHS
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -174,10 +210,17 @@ def load_persistent_settings():
                 if "MIN_NG_BLACK_PERCENT" in data: MIN_NG_BLACK_PERCENT = data["MIN_NG_BLACK_PERCENT"]
                 if "PHONE_CAMERA_DIR" in data: PHONE_CAMERA_DIR = data["PHONE_CAMERA_DIR"]
                 if "PHONE_RECORDINGS_DIR" in data: PHONE_RECORDINGS_DIR = data["PHONE_RECORDINGS_DIR"]
+                if "MASTER_REPORT_PATH" in data: MASTER_REPORT_PATH = data["MASTER_REPORT_PATH"]
+                if "MOBILE_HUD_PORT" in data: MOBILE_HUD_PORT = data["MOBILE_HUD_PORT"]
                 if "MAC_MINI_RELAY_URL" in data: MAC_MINI_RELAY_URL = data["MAC_MINI_RELAY_URL"]
                 if "MAC_MINI_RELAY_ENABLED" in data: MAC_MINI_RELAY_ENABLED = data["MAC_MINI_RELAY_ENABLED"]
                 if "MAC_MINI_RELAY_SECRET" in data: MAC_MINI_RELAY_SECRET = data["MAC_MINI_RELAY_SECRET"]
+                if "MOBILE_LAYOUT_SETTINGS" in data and isinstance(data["MOBILE_LAYOUT_SETTINGS"], dict):
+                    MOBILE_LAYOUT_SETTINGS.update(data["MOBILE_LAYOUT_SETTINGS"])
+                if "REVIEW_TABLE_COL_WIDTHS" in data and isinstance(data["REVIEW_TABLE_COL_WIDTHS"], dict):
+                    REVIEW_TABLE_COL_WIDTHS.update(data["REVIEW_TABLE_COL_WIDTHS"])
         except Exception:
             pass
 
-load_persistent_settings()
+load_persistent_settings()
+
