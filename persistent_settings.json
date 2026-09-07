@@ -1,20 +1,20 @@
 {
   "DEFECT_TREE": {
-    "Backsheet Defect": [
+    "Backsheet Defect 背板不良": [
       "Backsheet Defect",
       "Backsheet indentation",
       "Backsheet joint"
     ],
-    "Bubble Defect": [
+    "Bubble Defect 气泡不良": [
       "Bubble",
       "No melt"
     ],
-    "Cells Defect": [
+    "Cells Defect 电池片不良": [
       "Cell Defect",
       "Crack Cells",
       "Cell color difference"
     ],
-    "EL Defect": [
+    "EL Defect EL不良": [
       "EL Defect",
       "EL broken grid",
       "EL uneven brightness",
@@ -22,20 +22,20 @@
       "EL cold solder",
       "EL shaped microcrack"
     ],
-    "Equipment Scrap": [
+    "Equipment Scrap 设备报废": [
       "Equipment Scrap",
       "Busbar machine Scrap",
       "Conveyer line scrap",
-      "Edge Trimming Scrap",
+      "Edge Trimming machine Scrap",
       "Fixture machine scrap",
       "Frame installation machine scrap",
       "Junction box machine scrap",
-      "Laminator scrap",
+      "Laminator machine scrap",
       "Power outage Scrap",
       "Stringing machine scrap"
     ],
-    "Foreign object Defect": [
-      "Foreign object",
+    "Foreign material Defect 异物不良": [
+      "Foreign material",
       "Cell fragments",
       "Desiccant",
       "Dirty in the module",
@@ -52,9 +52,10 @@
       "Positioning tape",
       "Small label",
       "Solding balls",
-      "Teflon strip"
+      "Teflon strip",
+      "sawdust"
     ],
-    "Glass Defect": [
+    "Glass Defect 玻璃不良": [
       "Glass Defect",
       "Glass reversed",
       "Glass scratches",
@@ -62,34 +63,36 @@
       "Glass Missing",
       "Glass offset"
     ],
-    "Missalignment Defect": [
-      "Missalignment Defect",
+    "Missalignment Defect 间距不良": [
+      "间距不良 Cell Gap Defect",
       "String gap Defect",
       "Cell to Busbar Gap Defect",
-      "Ribbon excess",
-      "Creepage defect",
-      "Cell gap defect"
+      "Creepage by long ribbons",
+      "Poor creepage distance",
+      "Cells gap defect"
     ],
-    "Others Defects": [
-      "Defect Label",
+    "Others Defects 其它": [
+      "Others Defects",
       "Tin exposure on busbar",
       "Static pattern",
-      "Ribbon Not Cut"
+      "Ribbon Not Cut",
+      "Defect Label",
+      "label offset"
     ],
-    "Production Scrap": [
+    "Production Scrap 生产报废": [
       "Production caused Scrap",
-      "Rework causing scrap",
+      "Rework causing Scrapped",
       "Warehousing scrap",
       "Turnover scrap"
     ],
-    "Short Circuit Scrap": [
+    "Short Circuit Scrap 短路报废": [
       "Shorted cell scrap",
       "Cell overlap scrap",
       "Ribbon overlap scrap",
       "Busbar misalignment or missing",
       "Two cell scrap"
     ],
-    "Solder Defect": [
+    "Solder Defect 焊接不良": [
       "Solder Defect",
       "Ribbon offset",
       "No ribbon",

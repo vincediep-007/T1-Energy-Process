@@ -59,6 +59,15 @@ def parse_line_from_station(station_str: str) -> str:
             line_num = max(1, min(7, st_idx))
             return f"Line {line_num}"
 
+    # Layup Machine: TUMLAYUP1001 - TUMLAYUP1007
+    m_lay = re.search(r'TUMLAYUP(\d{4})', s)
+    if m_lay:
+        st_num = int(m_lay.group(1)) # 1001 to 1007
+        st_idx = st_num - 1000
+        if 1 <= st_idx <= 7:
+            line_num = max(1, min(7, st_idx))
+            return f"Line {line_num}"
+
     return ""
 
 
@@ -123,3 +132,42 @@ def get_responsible_shift_and_line(dt, station_str: str):
         shift_team = "C" if is_day else "D"
 
     return line_str, shift_team
+
+
+def get_evaluation_shift(dt=None) -> str:
+    """
+    Determines the Evaluation Shift (评审班次) for Excel export and operations:
+      - 'Day 白': 6am to 6pm (06:00:00 - 17:59:59)
+      - 'Night 夜': 6pm to 6am (18:00:00 - 05:59:59)
+    """
+    if dt is None:
+        dt = datetime.now()
+    elif isinstance(dt, str):
+        s = dt.strip()
+        if not s or s in ("-", "None", "Unknown", ""):
+            dt = datetime.now()
+        elif "DAY" in s.upper() or "白" in s:
+            return "Day 白"
+        elif "NIGHT" in s.upper() or "夜" in s:
+            return "Night 夜"
+        else:
+            parsed = None
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y/%m/%d %H:%M:%S",
+                "%m/%d/%Y %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M",
+                "%m/%d/%Y %H:%M",
+                "%H:%M:%S",
+                "%H:%M"
+            ):
+                try:
+                    parsed = datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    pass
+            dt = parsed if parsed else datetime.now()
+
+    hour = getattr(dt, 'hour', datetime.now().hour)
+    return "Day 白" if 6 <= hour < 18 else "Night 夜"

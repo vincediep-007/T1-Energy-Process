@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from typing import List, Dict, Optional
 import config
+from shift_calculator import get_evaluation_shift
 
 
 class DataManager:
@@ -220,8 +221,8 @@ def _sync_via_excel_com(master_path: str, records: List[Dict]) -> tuple:
             ws = wb.Sheets(1)
             ws.Name = "源数据data"
             headers = [
-                "日期\nDate", "单号\nOrder number", "序列号\nSerialN0", "不良汇总\nDefect Summary", 
-                "不良分类\nDefect Classification", "评审结果\nEvaluation Result", "不良问题\nDefect Cause", 
+                "日期\nDate", "单号\nOrder number", "序列号\nSerialN0", "不良归类\nDefect Classification", 
+                "不良描述\nDefect Description", "评审结果\nEvaluation Result", "不良问题\nDefect Cause", 
                 "不良位置\nLocation", "流转原因\npass Cause", "层压前图片\nLamination pre-picture", 
                 "层压后图片\nLamination Post-picture", "叠层时间\nlayup time", "测试机台\nTesting machine", 
                 "评审班次\nEvaluation Shift", "线别\nline", "责任班次\nResponsible shift", 
@@ -256,6 +257,15 @@ def _sync_via_excel_com(master_path: str, records: List[Dict]) -> tuple:
                     break
         if data_ws is None:
             data_ws = wb.Sheets(1)
+
+        # Pre-configure image column widths on target sheets
+        try:
+            data_ws.Columns(10).ColumnWidth = 18
+            data_ws.Columns(11).ColumnWidth = 18
+            if scrap_ws:
+                scrap_ws.Columns(10).ColumnWidth = 18
+                scrap_ws.Columns(11).ColumnWidth = 18
+        except Exception: pass
             
         # 2. Collect existing SNs to prevent duplicates
         last_row = data_ws.Cells(data_ws.Rows.Count, 3).End(-4162).Row # xlUp
@@ -281,25 +291,30 @@ def _sync_via_excel_com(master_path: str, records: List[Dict]) -> tuple:
             r_idx = cur_last_row + 1
             sn = _clean(rec.get('sn'))
             
+            def_summary = _clean(rec.get('summary'))
+            def_class = _clean(rec.get('class'))
+            if not def_class and def_summary and hasattr(config, 'get_class_for_summary'):
+                def_class = config.get_class_for_summary(def_summary)
+            
             target_sheet.Cells(r_idx, 1).Value = _clean(rec.get('date'))
             target_sheet.Cells(r_idx, 2).Value = _clean(rec.get('order'))
             target_sheet.Cells(r_idx, 3).Value = sn
-            target_sheet.Cells(r_idx, 4).Value = _clean(rec.get('summary'))
-            target_sheet.Cells(r_idx, 5).Value = _clean(rec.get('class'))
+            target_sheet.Cells(r_idx, 4).Value = def_class    # Column D: Defect Classification (不良归类)
+            target_sheet.Cells(r_idx, 5).Value = def_summary  # Column E: Defect Description (不良描述)
             target_sheet.Cells(r_idx, 6).Value = _clean(rec.get('result'))
             target_sheet.Cells(r_idx, 7).Value = _clean(rec.get('cause'))
             target_sheet.Cells(r_idx, 8).Value = _clean(rec.get('location'))
             target_sheet.Cells(r_idx, 9).Value = _clean(rec.get('pass_cause', ''))
             target_sheet.Cells(r_idx, 12).Value = _clean(rec.get('layup_time'))
             target_sheet.Cells(r_idx, 13).Value = _clean(rec.get('station'))
-            target_sheet.Cells(r_idx, 14).Value = _clean(rec.get('eval_shift'))
+            target_sheet.Cells(r_idx, 14).Value = get_evaluation_shift(rec.get('eval_shift') or rec.get('dt'))
             target_sheet.Cells(r_idx, 15).Value = _clean(rec.get('line'))
             target_sheet.Cells(r_idx, 16).Value = _clean(rec.get('shift'))
             target_sheet.Cells(r_idx, 17).Value = _clean(rec.get('review_position', ''))
             target_sheet.Cells(r_idx, 18).Value = _clean(rec.get('rework', ''))
             
             # Format row
-            target_sheet.Rows(r_idx).RowHeight = 80
+            target_sheet.Rows(r_idx).RowHeight = 40
             for c_col in range(1, 19):
                 cell_obj = target_sheet.Cells(r_idx, c_col)
                 cell_obj.HorizontalAlignment = -4108 # xlCenter
@@ -322,7 +337,6 @@ def _sync_via_excel_com(master_path: str, records: List[Dict]) -> tuple:
             if pre_path and os.path.exists(pre_path):
                 cell_j = target_sheet.Cells(r_idx, 10)
                 try:
-                    target_sheet.Columns(10).ColumnWidth = 18
                     pic_j = target_sheet.Shapes.AddPicture(
                         os.path.abspath(pre_path),
                         0,  # LinkToFile: msoFalse
@@ -341,7 +355,6 @@ def _sync_via_excel_com(master_path: str, records: List[Dict]) -> tuple:
             if post_path and os.path.exists(post_path):
                 cell_k = target_sheet.Cells(r_idx, 11)
                 try:
-                    target_sheet.Columns(11).ColumnWidth = 18
                     pic_k = target_sheet.Shapes.AddPicture(
                         os.path.abspath(post_path),
                         0,  # LinkToFile: msoFalse
@@ -419,8 +432,8 @@ def _sync_via_openpyxl(master_path: str, records: List[Dict]) -> tuple:
             ws = wb.active
             ws.title = "源数据data"
             headers = [
-                "日期\nDate", "单号\nOrder number", "序列号\nSerialN0", "不良汇总\nDefect Summary", 
-                "不良分类\nDefect Classification", "评审结果\nEvaluation Result", "不良问题\nDefect Cause", 
+                "日期\nDate", "单号\nOrder number", "序列号\nSerialN0", "不良归类\nDefect Classification", 
+                "不良描述\nDefect Description", "评审结果\nEvaluation Result", "不良问题\nDefect Cause", 
                 "不良位置\nLocation", "流转原因\npass Cause", "层压前图片\nLamination pre-picture", 
                 "层压后图片\nLamination Post-picture", "叠层时间\nlayup time", "测试机台\nTesting machine", 
                 "评审班次\nEvaluation Shift", "线别\nline", "责任班次\nResponsible shift", 
@@ -462,19 +475,28 @@ def _sync_via_openpyxl(master_path: str, records: List[Dict]) -> tuple:
             if sn and sn in existing_sns:
                 continue
 
+            def_summary = _clean(rec.get('summary'))
+            def_class = _clean(rec.get('class'))
+            if not def_class and def_summary and hasattr(config, 'get_class_for_summary'):
+                def_class = config.get_class_for_summary(def_summary)
+
             r_idx = ws.max_row + 1
             ws.cell(row=r_idx, column=1, value=_clean(rec.get('date')))
             ws.cell(row=r_idx, column=2, value=_clean(rec.get('order')))
             ws.cell(row=r_idx, column=3, value=sn)
-            ws.cell(row=r_idx, column=4, value=_clean(rec.get('summary')))
-            ws.cell(row=r_idx, column=5, value=_clean(rec.get('class')))
+            ws.cell(row=r_idx, column=4, value=def_class)   # Column D: Defect Classification (不良归类)
+            ws.cell(row=r_idx, column=5, value=def_summary) # Column E: Defect Description (不良描述)
             ws.cell(row=r_idx, column=6, value=_clean(rec.get('result')))
             ws.cell(row=r_idx, column=7, value=_clean(rec.get('cause')))
+            ws.cell(row=r_idx, column=8, value=_clean(rec.get('location')))
+            ws.cell(row=r_idx, column=9, value=_clean(rec.get('pass_cause', '')))
             ws.cell(row=r_idx, column=12, value=_clean(rec.get('layup_time')))
             ws.cell(row=r_idx, column=13, value=_clean(rec.get('station')))
-            ws.cell(row=r_idx, column=14, value=_clean(rec.get('eval_shift')))
+            ws.cell(row=r_idx, column=14, value=get_evaluation_shift(rec.get('eval_shift') or rec.get('dt')))
             ws.cell(row=r_idx, column=15, value=_clean(rec.get('line')))
             ws.cell(row=r_idx, column=16, value=_clean(rec.get('shift')))
+            ws.cell(row=r_idx, column=17, value=_clean(rec.get('review_position', '')))
+            ws.cell(row=r_idx, column=18, value=_clean(rec.get('rework', '')))
 
             # Style each cell in row
             for c_idx in range(1, 19):
@@ -506,14 +528,14 @@ def _sync_via_openpyxl(master_path: str, records: List[Dict]) -> tuple:
                     _to_j = AnchorMarker(col=col_j + 1, colOff=pixels_to_EMU(-4), row=row_num + 1, rowOff=pixels_to_EMU(-4))
                     img_pre.anchor = TwoCellAnchor(editAs='twoCell', _from=_from_j, to=_to_j)
                     ws.add_image(img_pre)
-                    ws.row_dimensions[r_idx].height = 80
+                    ws.row_dimensions[r_idx].height = 40
                 except Exception:
                     try:
                         img_pre = XLImage(pre_photo)
                         img_pre.width = 100
                         img_pre.height = 75
                         ws.add_image(img_pre, f"J{r_idx}")
-                        ws.row_dimensions[r_idx].height = 80
+                        ws.row_dimensions[r_idx].height = 40
                     except Exception: pass
 
             # 2. Embed Post-Layup Photo into Column K (MR Defect Photo / Snip)
@@ -531,14 +553,14 @@ def _sync_via_openpyxl(master_path: str, records: List[Dict]) -> tuple:
                     anchor = TwoCellAnchor(editAs='twoCell', _from=_from, to=_to)
                     img.anchor = anchor
                     ws.add_image(img)
-                    ws.row_dimensions[r_idx].height = 80
+                    ws.row_dimensions[r_idx].height = 40
                 except Exception:
                     try:
                         img = XLImage(photo_path)
                         img.width = 100
                         img.height = 75
                         ws.add_image(img, f"K{r_idx}")
-                        ws.row_dimensions[r_idx].height = 80
+                        ws.row_dimensions[r_idx].height = 40
                     except Exception: pass
 
             if sn and sn != "Pending SN":

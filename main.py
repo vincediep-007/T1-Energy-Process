@@ -7,12 +7,14 @@ import time
 import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
+import webbrowser
 import threading
 import queue
 from datetime import datetime, timedelta
 import calendar
 from PIL import Image, ImageTk, ImageGrab
 import win32clipboard
+import subprocess
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -33,8 +35,16 @@ from search_engine import ImageSearchEngine
 from image_processor import ImageProcessor
 from data_manager import DataManager, sync_to_master_excel
 
-from shift_calculator import get_responsible_shift_and_line
-from phone_server import start_phone_server, train_voice_pattern, test_mac_mini_relay_connection, get_file_datetime, refresh_save_folders_for_today, update_live_hud_state, rename_to_sn_pattern, get_mobile_hud_url
+from shift_calculator import get_responsible_shift_and_line, get_evaluation_shift
+from phone_server import (
+    start_phone_server, train_voice_pattern, test_mac_mini_relay_connection,
+    get_file_datetime, refresh_save_folders_for_today, update_live_hud_state,
+    rename_to_sn_pattern, get_mobile_hud_url, clean_and_validate_sn,
+    load_mes_trend_log, save_mes_trend_entry, query_mes_process_log,
+    get_mes_trend_analytics, export_mes_trend_csv_string, MES_TREND_FILE,
+    get_mes_layup_time_for_sn, parse_mes_datetime, extract_layup_time_from_content,
+    MES_CHINESE_DICTIONARY, translate_mes_text
+)
 
 
 
@@ -204,7 +214,7 @@ class ResultCard(tk.Frame):
         bot_row = tk.Frame(info_frame, bg=config.COLOR_CARD_BG)
         bot_row.pack(fill=tk.X, pady=(2, 0))
 
-        btn_view = tk.Button(bot_row, text="🔍 View Image", font=("Segoe UI", 8, "bold"), bg=config.COLOR_PRIMARY, fg="white", 
+        btn_view = tk.Button(bot_row, text="🖼️ View Image", font=("Segoe UI", 8, "bold"), bg=config.COLOR_PRIMARY, fg="white", 
                              activebackground="#0e4b70", activeforeground="white", relief=tk.FLAT, bd=0, padx=8, pady=2, cursor="hand2", command=self._on_click)
         btn_view.pack(side=tk.RIGHT, padx=(4, 0))
 
@@ -341,7 +351,886 @@ class Top5AnalyticsTab(tk.Frame):
             canvas.create_text(lx + 16, ly + 5, text=d_name, font=("Segoe UI", 8), fill="#334155", anchor="w")
             ly += 22
 
-# =================== QC DEFECT REVIEW TAB ===================
+
+# =================== MES CHINESE FIELD GUIDE & TRANSLATOR DIALOG ===================
+
+class MESChineseFieldGuideDialog(tk.Toplevel):
+    """
+    Dedicated Desktop Dialog providing comprehensive Chinese <-> English MES dictionary,
+    field mappings for FineReport Page 1/2 (组件生产流转), and an interactive
+    live text translator tool.
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Factory MES Chinese ↔ English Field Guide & Translator")
+        self.geometry("1020x750")
+        self.minsize(820, 600)
+        self.configure(bg=config.COLOR_BG_MAIN)
+        try:
+            self.transient(parent.winfo_toplevel() if hasattr(parent, 'winfo_toplevel') else parent)
+        except Exception:
+            pass
+
+        self.dict_items = list(MES_CHINESE_DICTIONARY)
+        self.filtered_items = list(self.dict_items)
+        self.current_cat = "All"
+        self.sort_col = "cn"
+        self.sort_reverse = False
+
+        self.setup_ui()
+        self.center_window()
+        self.populate_tree()
+
+    def center_window(self):
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def setup_ui(self):
+        # 1. Header Banner
+        header = tk.Frame(self, bg=config.COLOR_BG_MAIN, padx=16, pady=10)
+        header.pack(fill=tk.X)
+
+        tk.Label(
+            header,
+            text="🇨🇳/🇺🇸 Factory MES Chinese ↔ English Field Guide & Live Translator",
+            font=config.FONT_TITLE,
+            bg=config.COLOR_BG_MAIN,
+            fg=config.COLOR_TEXT_MAIN
+        ).pack(anchor=tk.W)
+
+        tk.Label(
+            header,
+            text="Comprehensive field mapping & terminology for FineReport Page 1/2 (组件生产流转) and Page 2/2 (Module Product Process Logsheet)",
+            font=config.FONT_SMALL,
+            bg=config.COLOR_BG_MAIN,
+            fg=config.COLOR_TEXT_SECONDARY
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        # 2. Interactive Live Text Translator Box
+        trans_frame = tk.Frame(self, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1, padx=14, pady=10)
+        trans_frame.pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        t_top = tk.Frame(trans_frame, bg="white")
+        t_top.pack(fill=tk.X)
+
+        tk.Label(
+            t_top,
+            text="🌐 Instant Chinese Text Translator",
+            font=("Segoe UI", 10, "bold"),
+            bg="white",
+            fg="#2563eb"
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            t_top,
+            text="Paste or type any Chinese text from MES (e.g. M12工序NG自动Hold, 上层3号位, 接线盒打胶 OK, 耐压 合格):",
+            font=("Segoe UI", 8),
+            bg="white",
+            fg="#64748b"
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        t_row = tk.Frame(trans_frame, bg="white")
+        t_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.ent_translate = tk.Entry(t_row, font=("Segoe UI", 10), bg=config.COLOR_INPUT_BG, relief=tk.FLAT, bd=4)
+        self.ent_translate.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.ent_translate.bind("<KeyRelease>", lambda e: self.on_live_translate())
+
+        ModernButton(t_row, text="📋 Paste", command=self.paste_to_translator, primary=False, padx=8, pady=2).pack(side=tk.LEFT, padx=(0, 4))
+        ModernButton(t_row, text="Translate", command=self.on_live_translate, primary=True, padx=8, pady=2).pack(side=tk.LEFT, padx=(0, 4))
+        ModernButton(t_row, text="Clear", command=self.clear_translator, primary=False, padx=6, pady=2).pack(side=tk.LEFT)
+
+        # Translation Result Box
+        self.res_frame = tk.Frame(trans_frame, bg="#f0fdf4", highlightbackground="#86efac", highlightthickness=1, padx=10, pady=6)
+        self.res_frame.pack(fill=tk.X, pady=(8, 0))
+
+        tk.Label(self.res_frame, text="English Meaning:", font=("Segoe UI", 9, "bold"), bg="#f0fdf4", fg="#166534").pack(side=tk.LEFT, padx=(0, 6))
+        self.lbl_trans_result = tk.Label(self.res_frame, text="Type or paste Chinese text above to translate instantly", font=("Segoe UI", 9), bg="#f0fdf4", fg="#15803d", wraplength=700, justify=tk.LEFT)
+        self.lbl_trans_result.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ModernButton(self.res_frame, text="📋 Copy", command=self.copy_translation_result, primary=False, padx=6, pady=1).pack(side=tk.RIGHT)
+
+        # 3. Search & Filter Bar for Field Dictionary Table
+        ctrl_frame = tk.Frame(self, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1, padx=12, pady=6)
+        ctrl_frame.pack(fill=tk.X, padx=16, pady=(0, 8))
+
+        tk.Label(ctrl_frame, text="🔍 Search Dictionary:", font=("Segoe UI", 9, "bold"), bg="white", fg="#1e293b").pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_search = tk.Entry(ctrl_frame, font=("Segoe UI", 9), width=20, bg=config.COLOR_INPUT_BG, relief=tk.FLAT, bd=3)
+        self.ent_search.pack(side=tk.LEFT, padx=(0, 8))
+        self.ent_search.bind("<KeyRelease>", lambda e: self.on_search_filter_changed())
+
+        # Category buttons
+        cat_box = tk.Frame(ctrl_frame, bg="white")
+        cat_box.pack(side=tk.LEFT)
+
+        self.cat_buttons = {}
+        cats = [("All", "All"), ("Header", "Headers"), ("Front-End", "Front-End"), ("Back-End", "Back-End"), ("Electrical", "Electrical"), ("Status", "Status")]
+        for cat_key, cat_label in cats:
+            btn = tk.Button(
+                cat_box,
+                text=cat_label,
+                font=("Segoe UI", 8, "bold" if cat_key == "All" else "normal"),
+                bg="#2563eb" if cat_key == "All" else "#f1f5f9",
+                fg="white" if cat_key == "All" else "#334155",
+                activebackground="#1d4ed8",
+                activeforeground="white",
+                relief=tk.FLAT,
+                bd=1,
+                padx=8,
+                pady=2,
+                cursor="hand2",
+                command=lambda k=cat_key: self.set_category_filter(k)
+            )
+            btn.pack(side=tk.LEFT, padx=2)
+            self.cat_buttons[cat_key] = btn
+
+        ModernButton(ctrl_frame, text="Reset", command=self.reset_filter, primary=False, padx=6, pady=2).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.lbl_dict_count = tk.Label(ctrl_frame, text="Showing: 0 / 0", font=("Segoe UI", 9, "bold"), bg="white", fg=config.COLOR_PRIMARY)
+        self.lbl_dict_count.pack(side=tk.RIGHT)
+
+        # 4. Dictionary Table (ttk.Treeview)
+        tbl_frame = tk.Frame(self, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1)
+        tbl_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        columns = [
+            ("cn", "Chinese Term (中文名称)", 140, "w"),
+            ("en", "English Translation (英文翻译)", 220, "w"),
+            ("cat", "Category (类别)", 135, "w"),
+            ("equipment", "Equipment Prefix (设备编号前缀)", 175, "w"),
+            ("page", "FineReport Page", 100, "center"),
+            ("desc", "Factory Context & Real Example (说明与示例)", 320, "w")
+        ]
+
+        col_ids = [c[0] for c in columns]
+        self.tree = ttk.Treeview(tbl_frame, columns=col_ids, show="headings", selectmode="browse")
+
+        v_scroll = ttk.Scrollbar(tbl_frame, orient="vertical", command=self.tree.yview)
+        h_scroll = ttk.Scrollbar(tbl_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        tbl_frame.grid_rowconfigure(0, weight=1)
+        tbl_frame.grid_columnconfigure(0, weight=1)
+
+        for col_id, col_text, col_w, col_anchor in columns:
+            self.tree.heading(col_id, text=col_text, command=lambda c=col_id: self.sort_by(c))
+            self.tree.column(col_id, width=col_w, anchor=col_anchor, minwidth=60)
+
+        self.tree.tag_configure("even", background="#ffffff")
+        self.tree.tag_configure("odd", background="#f8fafc")
+        self.tree.bind("<Double-1>", self.on_row_double_clicked)
+
+        # 5. Reference Sample Breakdown Box
+        ref_card = tk.Frame(self, bg="#f8fafc", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1, padx=12, pady=6)
+        ref_card.pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        tk.Label(
+            ref_card,
+            text="📌 Real Screenshot Breakdown (Module V01269003041442 on Page 1/2):",
+            font=("Segoe UI", 8, "bold"),
+            bg="#f8fafc",
+            fg="#1e293b"
+        ).pack(anchor=tk.W)
+
+        ref_txt = (
+            "• 焊接 (Welding): Stringer203 (TUMSOLERING1009) (2026-09-04 20:14) | "
+            "• 敷设 (Lay up): TUMLAYUP1004 (2026-09-05 07:27) | "
+            "• 层压 (Lamination): Lam18.2 (上层3号位) (2026-09-06 00:07)\n"
+            "• 料号 (Part/Lot No): 6A024170 | "
+            "• 等级 (Appearance/Final Grade): Q3 | "
+            "• 当前工序 (Current Station): M12 (M12工序NG自动Hold ➔ M12 Process NG Auto-Hold)"
+        )
+        tk.Label(
+            ref_card,
+            text=ref_txt,
+            font=("Consolas", 8),
+            bg="#f8fafc",
+            fg="#475569",
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        # 6. Bottom Action Buttons
+        bot_bar = tk.Frame(self, bg=config.COLOR_BG_MAIN, padx=16)
+        bot_bar.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(
+            bot_bar,
+            text="💡 Double-click any row to copy translation to clipboard",
+            font=config.FONT_SMALL,
+            bg=config.COLOR_BG_MAIN,
+            fg=config.COLOR_TEXT_SECONDARY
+        ).pack(side=tk.LEFT)
+
+        b_right = tk.Frame(bot_bar, bg=config.COLOR_BG_MAIN)
+        b_right.pack(side=tk.RIGHT)
+
+        ModernButton(b_right, text="📋 Copy Selected Term", command=self.copy_selected_term, primary=False).pack(side=tk.LEFT, padx=4)
+        ModernButton(b_right, text="📥 Copy Full Table (TSV)", command=self.copy_all_tsv, primary=False).pack(side=tk.LEFT, padx=4)
+        ModernButton(b_right, text="Close", command=self.destroy, primary=True).pack(side=tk.LEFT, padx=4)
+
+    def on_live_translate(self, event=None):
+        txt = self.ent_translate.get().strip()
+        if not txt:
+            self.lbl_trans_result.config(text="Type or paste Chinese text above to translate instantly", fg="#64748b")
+            return
+        translated = translate_mes_text(txt)
+        if translated:
+            self.lbl_trans_result.config(text=translated, fg="#15803d")
+        else:
+            self.lbl_trans_result.config(text="No direct translation match found.", fg="#b45309")
+
+    def paste_to_translator(self):
+        try:
+            txt = self.clipboard_get()
+            if txt:
+                self.ent_translate.delete(0, tk.END)
+                self.ent_translate.insert(0, txt.strip())
+                self.on_live_translate()
+        except Exception:
+            pass
+
+    def clear_translator(self):
+        self.ent_translate.delete(0, tk.END)
+        self.on_live_translate()
+
+    def copy_translation_result(self):
+        res = self.lbl_trans_result.cget("text")
+        if res and "Type or paste" not in res:
+            self.clipboard_clear()
+            self.clipboard_append(res)
+            messagebox.showinfo("Copied", f"Copied translation to clipboard:\n\n{res}")
+
+    def set_category_filter(self, cat):
+        self.current_cat = cat
+        for k, btn in self.cat_buttons.items():
+            if k == cat:
+                btn.config(bg="#2563eb", fg="white", font=("Segoe UI", 8, "bold"))
+            else:
+                btn.config(bg="#f1f5f9", fg="#334155", font=("Segoe UI", 8, "normal"))
+        self.apply_filter()
+
+    def on_search_filter_changed(self):
+        self.apply_filter()
+
+    def reset_filter(self):
+        self.ent_search.delete(0, tk.END)
+        self.set_category_filter("All")
+
+    def apply_filter(self):
+        q = self.ent_search.get().strip().lower()
+        items = list(self.dict_items)
+
+        if self.current_cat != "All":
+            items = [item for item in items if self.current_cat.lower() in item.get('cat', '').lower()]
+
+        if q:
+            items = [
+                item for item in items if (
+                    q in item.get('cn', '').lower() or
+                    q in item.get('en', '').lower() or
+                    q in item.get('cat', '').lower() or
+                    q in item.get('equipment', '').lower() or
+                    q in item.get('desc', '').lower()
+                )
+            ]
+
+        # Sorting
+        items.sort(key=lambda x: str(x.get(self.sort_col, '')).lower(), reverse=self.sort_reverse)
+        self.filtered_items = items
+        self.populate_tree()
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
+        self.apply_filter()
+
+    def populate_tree(self):
+        for row_id in self.tree.get_children():
+            self.tree.delete(row_id)
+
+        for i, item in enumerate(self.filtered_items):
+            tag = "even" if i % 2 == 0 else "odd"
+            vals = (
+                item.get('cn', '-'),
+                item.get('en', '-'),
+                item.get('cat', '-'),
+                item.get('equipment', '-'),
+                item.get('page', '-'),
+                item.get('desc', '-')
+            )
+            self.tree.insert("", tk.END, values=vals, tags=(tag,))
+
+        self.lbl_dict_count.config(text=f"Showing: {len(self.filtered_items)} / {len(self.dict_items)}")
+
+    def on_row_double_clicked(self, event):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0]).get('values', [])
+        if len(vals) >= 2:
+            copy_txt = f"{vals[0]} ({vals[1]})"
+            self.clipboard_clear()
+            self.clipboard_append(copy_txt)
+            messagebox.showinfo("Copied", f"Copied to clipboard:\n\n{copy_txt}")
+
+    def copy_selected_term(self):
+        self.on_row_double_clicked(None)
+
+    def copy_all_tsv(self):
+        lines = ["Chinese\tEnglish Translation\tCategory\tEquipment\tPage\tDescription"]
+        for item in self.dict_items:
+            lines.append(f"{item.get('cn','')}\t{item.get('en','')}\t{item.get('cat','')}\t{item.get('equipment','')}\t{item.get('page','')}\t{item.get('desc','')}")
+        tsv_data = "\n".join(lines)
+        self.clipboard_clear()
+        self.clipboard_append(tsv_data)
+        messagebox.showinfo("Copied All", f"Full MES dictionary ({len(self.dict_items)} terms) copied to clipboard as TSV!")
+
+
+# =================== MES PROCESS LOG TAB ===================
+
+class MESProcessLogTab(tk.Frame):
+    """
+    Dedicated Laptop Display Tab for MES Process Log & Machine Trend Tracker.
+    Separates factory Electronic Transfer Order activity (TUMSOLDERING, TUMLAYUP, TUMLAMINATION)
+    completely from Module Review defect grading.
+    """
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=config.COLOR_BG_MAIN, padx=15, pady=10)
+        self.app = app
+        self.records = []
+        self.filtered_records = []
+        self.sort_col = "time"
+        self.sort_reverse = True
+        self.setup_ui()
+        self.load_records()
+
+    def setup_ui(self):
+        # 1. Top Bar: Title, Subtitle, and Global Action Buttons
+        top_bar = tk.Frame(self, bg=config.COLOR_BG_MAIN)
+        top_bar.pack(fill=tk.X, pady=(0, 8))
+
+        title_frame = tk.Frame(top_bar, bg=config.COLOR_BG_MAIN)
+        title_frame.pack(side=tk.LEFT, fill=tk.Y)
+        
+        tk.Label(
+            title_frame,
+            text="📋 Factory MES Process Log (Electronic Transfer Order)",
+            font=config.FONT_TITLE,
+            bg=config.COLOR_BG_MAIN,
+            fg=config.COLOR_TEXT_MAIN
+        ).pack(anchor=tk.W)
+
+        self.lbl_server_status = tk.Label(
+            title_frame,
+            text="Host: 10.200.3.109:8080 (FineReport Decision Platform) | Storage: mes_process_trend_log.json",
+            font=config.FONT_SMALL,
+            bg=config.COLOR_BG_MAIN,
+            fg=config.COLOR_TEXT_SECONDARY
+        )
+        self.lbl_server_status.pack(anchor=tk.W, pady=(2, 0))
+
+        btn_box = tk.Frame(top_bar, bg=config.COLOR_BG_MAIN)
+        btn_box.pack(side=tk.RIGHT)
+
+        ModernButton(btn_box, text="🌐 MES Active Tab", command=self.open_mes_portal, primary=True).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="🔐 Login (030888)", command=self.open_mes_login, primary=False).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="🇨🇳 Chinese Guide", command=self.open_chinese_guide, primary=False).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="📁 MES Photos", command=self.open_mes_photos_folder, primary=False).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="🔄 Refresh Log", command=self.refresh_log, primary=False).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="📥 Export CSV", command=self.export_csv, primary=True).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="🗑️ Clear Log", command=self.clear_log, primary=False).pack(side=tk.LEFT, padx=3)
+
+        # 2. Top KPI Metric Cards Frame
+        kpi_frame = tk.Frame(self, bg=config.COLOR_BG_MAIN)
+        kpi_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.kpi_cards = {}
+        cards_def = [
+            ("total", "Total Logged Modules", "#2563eb", "0", "Panels recorded"),
+            ("soldering", "Welding (Stringer)", "#d97706", "-", "Top stringer line"),
+            ("layup", "Lay up (TUMLAYUP)", "#059669", "-", "Top layup machine"),
+            ("lamination", "Lamination (Lam)", "#7c3aed", "-", "Top lamination deck")
+        ]
+        for key, title, col, init_val, sub in cards_def:
+            card = tk.Frame(kpi_frame, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1, padx=12, pady=8)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+            
+            lbl_title = tk.Label(card, text=title, font=("Segoe UI", 9, "bold"), bg="white", fg=col)
+            lbl_title.pack(anchor=tk.W)
+
+            lbl_val = tk.Label(card, text=init_val, font=("Segoe UI", 14, "bold"), bg="white", fg="#0f172a")
+            lbl_val.pack(anchor=tk.W, pady=(2, 2))
+
+            lbl_sub = tk.Label(card, text=sub, font=("Segoe UI", 8), bg="white", fg="#64748b")
+            lbl_sub.pack(anchor=tk.W)
+
+            self.kpi_cards[key] = (lbl_val, lbl_sub)
+
+        # 3. Control Action Bar: Direct SN Query & Real-Time Filter
+        ctrl_bar = tk.Frame(self, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1, padx=10, pady=6)
+        ctrl_bar.pack(fill=tk.X, pady=(0, 8))
+
+        # Direct Laptop Query
+        q_frame = tk.Frame(ctrl_bar, bg="white")
+        q_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+        tk.Label(q_frame, text="🔍 Query MES SN:", font=("Segoe UI", 9, "bold"), bg="white", fg="#1e293b").pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_query_sn = tk.Entry(q_frame, font=("Segoe UI", 10, "bold"), width=18, bg=config.COLOR_INPUT_BG, relief=tk.FLAT, bd=3)
+        self.ent_query_sn.pack(side=tk.LEFT, padx=(0, 6))
+        self.ent_query_sn.bind("<Return>", lambda e: self.query_sn())
+
+        ModernButton(q_frame, text="Search & Query", command=self.query_sn, primary=True, padx=8, pady=2).pack(side=tk.LEFT, padx=(0, 8))
+        self.lbl_query_status = tk.Label(q_frame, text="Ready", font=("Segoe UI", 9), bg="white", fg="#64748b")
+        self.lbl_query_status.pack(side=tk.LEFT)
+
+        # Filter on Right
+        f_frame = tk.Frame(ctrl_bar, bg="white")
+        f_frame.pack(side=tk.RIGHT, fill=tk.Y)
+
+        tk.Label(f_frame, text="Filter Records:", font=("Segoe UI", 9), bg="white", fg="#1e293b").pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_filter = tk.Entry(f_frame, font=("Segoe UI", 9), width=18, bg=config.COLOR_INPUT_BG, relief=tk.FLAT, bd=3)
+        self.ent_filter.pack(side=tk.LEFT, padx=(0, 6))
+        self.ent_filter.bind("<KeyRelease>", lambda e: self.on_filter_changed())
+
+        ModernButton(f_frame, text="Clear", command=self.clear_filter, primary=False, padx=6, pady=2).pack(side=tk.LEFT, padx=(0, 8))
+        self.lbl_count_tag = tk.Label(f_frame, text="Showing: 0 / 0", font=("Segoe UI", 9, "bold"), bg="white", fg=config.COLOR_PRIMARY)
+        self.lbl_count_tag.pack(side=tk.LEFT)
+
+        # 4. Table Container with ttk.Treeview
+        table_container = tk.Frame(self, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1)
+        table_container.pack(fill=tk.BOTH, expand=True)
+
+        self.columns = [
+            ("time", "Timestamp", 135, "center"),
+            ("sn", "Serial Number (V01)", 155, "center"),
+            ("soldering", "Welding (Stringer)", 155, "w"),
+            ("layup", "Lay up (TUMLAYUP)", 145, "w"),
+            ("lamination", "Lamination (Lam)", 165, "w"),
+            ("family", "Product Family", 145, "w"),
+            ("lot", "Lot No", 95, "center"),
+            ("mo", "MO No", 100, "center"),
+            ("grade", "Grade", 70, "center"),
+            ("defect", "Defect / Note", 130, "w"),
+            ("result", "Result", 75, "center")
+        ]
+
+        col_ids = [c[0] for c in self.columns]
+        self.tree = ttk.Treeview(table_container, columns=col_ids, show="headings", selectmode="browse")
+
+        style = ttk.Style()
+        style.configure("MESTree.Treeview", font=("Segoe UI", 9), rowheight=27)
+        style.configure("MESTree.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        self.tree.configure(style="MESTree.Treeview")
+
+        v_scroll = ttk.Scrollbar(table_container, orient="vertical", command=self.tree.yview)
+        h_scroll = ttk.Scrollbar(table_container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        table_container.grid_rowconfigure(0, weight=1)
+        table_container.grid_columnconfigure(0, weight=1)
+
+        for col_id, col_text, col_w, col_anchor in self.columns:
+            self.tree.heading(col_id, text=col_text, command=lambda c=col_id: self.sort_by_column(c))
+            self.tree.column(col_id, width=col_w, anchor=col_anchor, minwidth=60)
+
+        # Row tag colors
+        self.tree.tag_configure("complete", background="#f0fdf4", foreground="#065f46")   # All 3 machines present
+        self.tree.tag_configure("partial", background="#fefce8", foreground="#854d0e")    # 1-2 machines present
+        self.tree.tag_configure("blank", background="#fef2f2", foreground="#991b1b")      # 0 machines present
+
+        self.tree.bind("<Double-1>", self.on_row_double_clicked)
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
+        # Context Menu
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="📋 Copy Serial Number", command=self.copy_selected_sn)
+        self.context_menu.add_command(label="📋 Copy All Record Details", command=self.copy_selected_row)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="🖼️ View Saved MES Photo", command=self.view_selected_mes_photo)
+        self.context_menu.add_command(label="📁 Open MES Photos Folder", command=self.open_mes_photos_folder)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="🇨🇳 Chinese MES Field Guide & Translator", command=self.open_chinese_guide)
+        self.context_menu.add_command(label="🔍 Re-query MES for this SN", command=self.requery_selected_sn)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="❌ Delete from Log", command=self.delete_selected_record)
+
+        # 5. Footer Bar
+        footer = tk.Frame(self, bg=config.COLOR_BG_MAIN)
+        footer.pack(fill=tk.X, pady=(6, 0))
+
+        self.lbl_footer = tk.Label(
+            footer,
+            text="💡 Double-click row to copy SN | Click '🇨🇳 Chinese Guide' for Page 1/2 field glossary | Synchronized in real-time with Mobile Hub",
+            font=config.FONT_SMALL,
+            bg=config.COLOR_BG_MAIN,
+            fg=config.COLOR_TEXT_SECONDARY
+        )
+        self.lbl_footer.pack(side=tk.LEFT)
+
+    def load_records(self):
+        self.records = load_mes_trend_log()
+        self.apply_filter()
+        self.update_kpi_cards()
+
+    def refresh_log(self):
+        self.load_records()
+        self.lbl_query_status.config(text="Log refreshed", fg="#059669")
+
+    def handle_incoming_mes_record(self, data):
+        if not data or not isinstance(data, dict): return
+        sn = data.get('sn', '').strip()
+        if not sn: return
+
+        # Update in-memory records
+        existing_idx = None
+        for i, r in enumerate(self.records):
+            if r.get('sn') == sn:
+                existing_idx = i
+                break
+        
+        if existing_idx is not None:
+            self.records[existing_idx].update(data)
+        else:
+            self.records.insert(0, data)
+
+        self.apply_filter()
+        self.update_kpi_cards()
+        self.lbl_query_status.config(text=f"✅ Logged {sn}", fg="#059669")
+
+    def on_filter_changed(self, event=None):
+        self.apply_filter()
+
+    def clear_filter(self):
+        self.ent_filter.delete(0, tk.END)
+        self.apply_filter()
+
+    def apply_filter(self):
+        query = self.ent_filter.get().strip().lower()
+        if not query:
+            filtered = list(self.records)
+        else:
+            filtered = []
+            for r in self.records:
+                combined = " ".join([
+                    str(r.get('sn', '')),
+                    str(r.get('tumsoldering', '')),
+                    str(r.get('tumlayup', '')),
+                    str(r.get('tumlamination', '')),
+                    str(r.get('product_family', '')),
+                    str(r.get('lot_no', '')),
+                    str(r.get('mo_no', '')),
+                    str(r.get('appearance_grade', '')),
+                    str(r.get('defect', '')),
+                    str(r.get('result', ''))
+                ]).lower()
+                if query in combined:
+                    filtered.append(r)
+
+        # Sorting
+        def _sort_key(item):
+            val = item.get(self.sort_col, '')
+            if self.sort_col == 'time': val = item.get('layup_time') or item.get('timestamp', '')
+            return str(val).lower()
+
+        filtered.sort(key=_sort_key, reverse=self.sort_reverse)
+        self.filtered_records = filtered
+
+        # Populate tree
+        for row_id in self.tree.get_children():
+            self.tree.delete(row_id)
+
+        for r in self.filtered_records:
+            s = str(r.get('tumsoldering', '')).strip()
+            ly = str(r.get('tumlayup', '')).strip()
+            lm = str(r.get('tumlamination', '')).strip()
+
+            if s and ly and lm:
+                tag = "complete"
+            elif s or ly or lm:
+                tag = "partial"
+            else:
+                tag = "blank"
+
+            def_val = str(r.get('defect') or r.get('current_step') or '-').strip()
+            if def_val and def_val != '-' and any('\u4e00' <= char <= '\u9fff' for char in def_val):
+                def_val = translate_mes_text(def_val)
+
+            vals = (
+                r.get('layup_time') or r.get('timestamp', '-'),
+                r.get('sn', '-'),
+                s or '(Blank)',
+                ly or '(Blank)',
+                lm or '(Blank)',
+                r.get('product_family', '-'),
+                r.get('lot_no', '-'),
+                r.get('mo_no', '-'),
+                r.get('appearance_grade', '-'),
+                def_val,
+                r.get('result', '-')
+            )
+            self.tree.insert("", tk.END, values=vals, tags=(tag,))
+
+        self.lbl_count_tag.config(text=f"Showing: {len(self.filtered_records)} / {len(self.records)}")
+
+    def sort_by_column(self, col_id):
+        if self.sort_col == col_id:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col_id
+            self.sort_reverse = False
+        self.apply_filter()
+
+    def update_kpi_cards(self):
+        analytics = get_mes_trend_analytics()
+        tot = analytics.get('total_logged', 0)
+        
+        lbl_tot_val, lbl_tot_sub = self.kpi_cards.get('total', (None, None))
+        if lbl_tot_val:
+            lbl_tot_val.config(text=str(tot))
+            lbl_tot_sub.config(text=f"{len(self.filtered_records)} matching filter" if len(self.filtered_records) != tot else "Panels recorded")
+
+        def _set_kpi(key, top_list, title_name):
+            val_el, sub_el = self.kpi_cards.get(key, (None, None))
+            if not val_el: return
+            if top_list and len(top_list) > 0:
+                top_item = top_list[0]
+                val_el.config(text=f"{top_item['name']} ({top_item['pct']}%)")
+                sub_el.config(text=f"{top_item['count']} panels | {len(top_list)} machine(s) in use")
+            else:
+                val_el.config(text="-")
+                sub_el.config(text=f"No {title_name} data yet")
+
+        _set_kpi('soldering', analytics.get('soldering_top', []), "welding")
+        _set_kpi('layup', analytics.get('layup_top', []), "lay up")
+        _set_kpi('lamination', analytics.get('lamination_top', []), "lamination")
+
+    def query_sn(self):
+        sn = self.ent_query_sn.get().strip().upper()
+        if not sn:
+            self.lbl_query_status.config(text="Please enter SN", fg="#dc2626")
+            return
+        if not sn.startswith("V01") or len(sn) < 8:
+            messagebox.showwarning("Invalid SN", "Please enter a valid Module Serial Number starting with V01.")
+            return
+
+        self.lbl_query_status.config(text=f"Logging in (030888) & Querying MES for {sn}...", fg="#2563eb")
+
+        def _worker():
+            try:
+                res = query_mes_process_log(sn)
+                def _ui():
+                    if res.get('raw_found'):
+                        lt_info = f" ({res.get('layup_time')})" if res.get('layup_time') else ""
+                        sol = res.get('tumsoldering', '')
+                        lay = res.get('tumlayup', '')
+                        lam = res.get('tumlamination', '')
+                        mach_str = " | ".join([m for m in [sol, lay, lam] if m])
+                        self.lbl_query_status.config(text=f"✅ Found: {mach_str}{lt_info}", fg="#059669")
+                        self.load_records()
+                    elif res.get('status') == 'offline_pc':
+                        self.lbl_query_status.config(text="⚠️ Host PC on office Wi-Fi (10.200.3.109 unreachable). Connect to plant LAN.", fg="#d97706")
+                    else:
+                        self.lbl_query_status.config(text=f"Complete. No record found for {sn}.", fg="#64748b")
+                self.after(0, _ui)
+            except Exception as err:
+                self.after(0, lambda: self.lbl_query_status.config(text=f"Query error: {err}", fg="#dc2626"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def export_csv(self):
+        csv_content = export_mes_trend_csv_string()
+        def_fname = f"MES_Process_Log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        fpath = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            initialfile=def_fname
+        )
+        if fpath:
+            try:
+                with open(fpath, 'w', encoding='utf-8') as f:
+                    f.write(csv_content)
+                messagebox.showinfo("Export Success", f"MES Process Log exported successfully to:\n{fpath}")
+            except Exception as e:
+                messagebox.showerror("Export Failed", f"Could not write CSV file:\n{e}")
+
+    def clear_log(self):
+        if not self.records:
+            messagebox.showinfo("Log Empty", "MES Process Log is already empty.")
+            return
+        if messagebox.askyesno("Clear MES Log", "Are you sure you want to clear all MES Process Log entries?\nThis will permanently reset the trend log file."):
+            try:
+                with open(MES_TREND_FILE, 'w', encoding='utf-8') as f:
+                    json.dump([], f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"Clear log error: {e}")
+            self.load_records()
+            self.lbl_query_status.config(text="Log cleared", fg="#64748b")
+
+    def open_mes_portal(self):
+        base_tab_url = "http://10.200.3.109:8080/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true"
+        sn = self.ent_query_sn.get().strip()
+        url = base_tab_url
+        if sn:
+            enc_sn = urllib.parse.quote(sn)
+            url = f"{base_tab_url}&MOUDLEID={enc_sn}&__bypassevent__=true&组件序列号={enc_sn}&ModuleSerialNo={enc_sn}&SN={enc_sn}"
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(sn)
+                self.lbl_query_status.config(text=f"📋 Copied {sn} to clipboard. Opening MES Tab...", fg="#059669")
+            except Exception:
+                pass
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("Cannot Open Browser", f"Error opening URL:\n{e}")
+
+    def open_mes_login(self):
+        url = "http://10.200.3.109:8080/webroot/decision/login"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append("030888")
+            self.lbl_query_status.config(text="🔐 Copied 030888 to clipboard. Opening Login...", fg="#059669")
+        except Exception:
+            pass
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("Cannot Open Browser", f"Error opening URL:\n{e}")
+
+    def on_row_double_clicked(self, event):
+        sel = self.tree.selection()
+        if not sel: return
+        item = self.tree.item(sel[0])
+        vals = item.get('values', [])
+        if len(vals) > 1:
+            sn = str(vals[1])
+            self.clipboard_clear()
+            self.clipboard_append(sn)
+            self.lbl_query_status.config(text=f"📋 Copied SN: {sn}", fg="#059669")
+
+    def show_context_menu(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self.tree.selection_set(item_id)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def copy_selected_sn(self):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0]).get('values', [])
+        if len(vals) > 1:
+            sn = str(vals[1])
+            self.clipboard_clear()
+            self.clipboard_append(sn)
+            self.lbl_query_status.config(text=f"📋 Copied SN: {sn}", fg="#059669")
+
+    def copy_selected_row(self):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0]).get('values', [])
+        txt = "\t".join(str(v) for v in vals)
+        self.clipboard_clear()
+        self.clipboard_append(txt)
+        self.lbl_query_status.config(text="📋 Copied row details", fg="#059669")
+
+    def requery_selected_sn(self):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0]).get('values', [])
+        if len(vals) > 1:
+            sn = str(vals[1])
+            self.ent_query_sn.delete(0, tk.END)
+            self.ent_query_sn.insert(0, sn)
+            self.query_sn()
+
+    def delete_selected_record(self):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0]).get('values', [])
+        if len(vals) > 1:
+            sn = str(vals[1])
+            if messagebox.askyesno("Delete Record", f"Remove record for SN '{sn}' from MES log?"):
+                self.records = [r for r in self.records if r.get('sn') != sn]
+                try:
+                    with open(MES_TREND_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(self.records, f, ensure_ascii=False, indent=2)
+                except Exception: pass
+                self.apply_filter()
+                self.update_kpi_cards()
+                self.lbl_query_status.config(text=f"Deleted {sn}", fg="#64748b")
+
+    def open_mes_photos_folder(self):
+        mes_dir = getattr(config, 'MES_PHOTOS_DIR', os.path.join(config.LOCAL_DATA_DIR, 'mes_photos'))
+        os.makedirs(mes_dir, exist_ok=True)
+        try:
+            if os.name == 'nt':
+                os.startfile(mes_dir)
+            else:
+                subprocess.Popen(['xdg-open', mes_dir])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open MES photos folder:\n{e}")
+
+    def view_selected_mes_photo(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("View Photo", "Please select a record from the table first.")
+            return
+        vals = self.tree.item(sel[0]).get('values', [])
+        if len(vals) < 2: return
+        sn = str(vals[1]).strip()
+
+        found_photo = ""
+        # 1. Check in-memory records for saved photo_path
+        for rec in self.records:
+            if rec.get('sn') == sn and rec.get('photo_path') and os.path.exists(rec.get('photo_path')):
+                found_photo = rec.get('photo_path')
+                break
+
+        # 2. Check MES_PHOTOS_DIR and DailyCache/mes_photos
+        if not found_photo:
+            mes_dir = getattr(config, 'MES_PHOTOS_DIR', os.path.join(config.LOCAL_DATA_DIR, 'mes_photos'))
+            daily_mes_dir = os.path.join(getattr(config, 'DAILY_CACHE_DIR', ''), 'mes_photos')
+            for d in [mes_dir, daily_mes_dir]:
+                if not os.path.exists(d): continue
+                for fname in os.listdir(d):
+                    if sn in fname:
+                        found_photo = os.path.join(d, fname)
+                        break
+                if found_photo: break
+
+        if found_photo and os.path.exists(found_photo):
+            try:
+                if os.name == 'nt':
+                    os.startfile(found_photo)
+                else:
+                    subprocess.Popen(['xdg-open', found_photo])
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open photo file:\n{e}")
+        else:
+            messagebox.showinfo(
+                "MES Photo",
+                f"No saved MES photo found for Serial Number:\n{sn}\n\n"
+                "Photos are captured from Mobile Hub Tab 3 using '1. MES Barcode' or '2. Get SN Pic' and saved into the dedicated 'mes_photos' folder."
+            )
+
+    def open_chinese_guide(self):
+        MESChineseFieldGuideDialog(self)
+
+
 
 # =================== QR CODE GENERATOR & VIEWER ===================
 
@@ -846,15 +1735,8 @@ class ImageSnipperDialog(tk.Toplevel):
             snip_filename = f"Snip_{cat_tag}_{sn}_{timestamp}.jpg"
             snip_path = os.path.join(cache_dir, snip_filename)
             
-            # 2. Compress targeting ~150-200 KB max for fast Excel loading
-            max_kb = 200
-            for q in [82, 75, 68, 60, 50]:
-                buf = io.BytesIO()
-                cropped.save(buf, format='JPEG', quality=q, optimize=True)
-                if buf.tell() <= max_kb * 1024 or q == 50:
-                    with open(snip_path, 'wb') as f:
-                        f.write(buf.getvalue())
-                    break
+            # 2. Fast single-pass save (< 3ms) targeting ~150-200 KB max for fast Excel loading
+            cropped.save(snip_path, format='JPEG', quality=82)
             
             if self.record is not None:
                 if "PRE" in cat_tag.upper():
@@ -1411,7 +2293,7 @@ class ModuleReviewTab(tk.Frame):
                     return top_rec
 
         # 5. Exceeds 2 minutes or session already filled -> create a brand new panel record
-        eval_shift = "Day白" if 6 <= item_dt.hour < 18 else "Night夜"
+        eval_shift = get_evaluation_shift(item_dt)
         new_rec = {
             'id': f"rec_{int(time.time()*1000)}_{len(self.records)}",
             'dt': item_dt,
@@ -1437,233 +2319,318 @@ class ModuleReviewTab(tk.Frame):
         self.records.insert(0, new_rec)
         return new_rec
 
-    def refresh_treeview(self):
-        for widget in self.rows_frame.winfo_children():
-            widget.destroy()
+    def _create_row_frame(self, rec, idx, total_w):
+        row_frame = tk.Frame(self.rows_frame, height=40, width=total_w)
+        row_frame.pack(anchor="nw", fill=tk.X, pady=1)
+        row_frame.pack_propagate(False)
+        row_frame._rec_id = rec.get('id')
+        row_frame._cells = {}
+        row_frame._widget_refs = {}
+        cell_frames = []
 
+        def bind_select(w, r=rec):
+            w.bind("<Button-1>", lambda e, rec_item=r: self.select_record(rec_item))
+
+        bind_select(row_frame)
+
+        # 0. Date
+        c0 = tk.Frame(row_frame, width=self.col_widths.get("date", 100), height=38)
+        c0.pack(side=tk.LEFT, padx=0)
+        c0.pack_propagate(False)
+        row_frame._cells["date"] = c0
+        cell_frames.append(c0)
+        l0 = tk.Label(c0, font=("Segoe UI", 9))
+        l0.pack(fill=tk.BOTH, expand=True)
+        bind_select(l0)
+        sp0 = tk.Frame(row_frame, width=5, height=38)
+        sp0.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp0)
+
+        # 1. SN
+        c1 = tk.Frame(row_frame, width=self.col_widths.get("sn", 175), height=38)
+        c1.pack(side=tk.LEFT, padx=0)
+        c1.pack_propagate(False)
+        row_frame._cells["sn"] = c1
+        cell_frames.append(c1)
+        l1 = tk.Label(c1, font=("Segoe UI", 9, "bold"))
+        l1.pack(fill=tk.BOTH, expand=True)
+        bind_select(l1)
+        sp1 = tk.Frame(row_frame, width=5, height=38)
+        sp1.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp1)
+
+        # 2. Defect Summary
+        c2 = tk.Frame(row_frame, width=self.col_widths.get("summary", 160), height=38)
+        c2.pack(side=tk.LEFT, padx=0)
+        c2.pack_propagate(False)
+        row_frame._cells["summary"] = c2
+        cell_frames.append(c2)
+        l2 = tk.Label(c2, font=("Segoe UI", 9))
+        l2.pack(fill=tk.BOTH, expand=True)
+        bind_select(l2)
+        sp2 = tk.Frame(row_frame, width=5, height=38)
+        sp2.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp2)
+
+        # 3. Grade (Q3 / Scrap)
+        c3 = tk.Frame(row_frame, width=self.col_widths.get("grade", 80), height=38)
+        c3.pack(side=tk.LEFT, padx=0)
+        c3.pack_propagate(False)
+        row_frame._cells["grade"] = c3
+        cell_frames.append(c3)
+        l3 = tk.Label(c3, font=("Segoe UI", 9))
+        l3.pack(expand=True)
+        bind_select(l3)
+        sp3 = tk.Frame(row_frame, width=5, height=38)
+        sp3.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp3)
+
+        # 4. PreEL (3 Buttons: Front, EL, Back)
+        c4 = tk.Frame(row_frame, width=self.col_widths.get("pre_el", 210), height=38)
+        c4.pack(side=tk.LEFT, padx=0)
+        c4.pack_propagate(False)
+        row_frame._cells["pre_el"] = c4
+        cell_frames.append(c4)
+        f_btn_box = tk.Frame(c4)
+        f_btn_box.pack(expand=True)
+        btn_f = tk.Button(f_btn_box, text="Front", font=("Segoe UI", 8), padx=4, pady=2, relief=tk.FLAT)
+        btn_f.pack(side=tk.LEFT, padx=1)
+        btn_el = tk.Button(f_btn_box, text="EL", font=("Segoe UI", 8), padx=4, pady=2, relief=tk.FLAT)
+        btn_el.pack(side=tk.LEFT, padx=1)
+        btn_b = tk.Button(f_btn_box, text="Back", font=("Segoe UI", 8), padx=4, pady=2, relief=tk.FLAT)
+        btn_b.pack(side=tk.LEFT, padx=1)
+        sp4 = tk.Frame(row_frame, width=5, height=38)
+        sp4.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp4)
+
+        # 5. MR Defect Pic
+        c5 = tk.Frame(row_frame, width=self.col_widths.get("mr_pic", 125), height=38)
+        c5.pack(side=tk.LEFT, padx=0)
+        c5.pack_propagate(False)
+        row_frame._cells["mr_pic"] = c5
+        cell_frames.append(c5)
+        btn_mr = tk.Button(c5, text="No Pic", font=("Segoe UI", 8), padx=6, pady=2, relief=tk.FLAT)
+        btn_mr.pack(expand=True)
+        sp5 = tk.Frame(row_frame, width=5, height=38)
+        sp5.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp5)
+
+        # 6. PreEL Time
+        c6 = tk.Frame(row_frame, width=self.col_widths.get("layup_time", 155), height=38)
+        c6.pack(side=tk.LEFT, padx=0)
+        c6.pack_propagate(False)
+        row_frame._cells["layup_time"] = c6
+        cell_frames.append(c6)
+        l6 = tk.Label(c6, font=("Segoe UI", 9))
+        l6.pack(fill=tk.BOTH, expand=True)
+        bind_select(l6)
+        sp6 = tk.Frame(row_frame, width=5, height=38)
+        sp6.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp6)
+
+        # 7. Station
+        c7 = tk.Frame(row_frame, width=self.col_widths.get("station", 110), height=38)
+        c7.pack(side=tk.LEFT, padx=0)
+        c7.pack_propagate(False)
+        row_frame._cells["station"] = c7
+        cell_frames.append(c7)
+        l7 = tk.Label(c7, font=("Segoe UI", 9))
+        l7.pack(fill=tk.BOTH, expand=True)
+        bind_select(l7)
+        sp7 = tk.Frame(row_frame, width=5, height=38)
+        sp7.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp7)
+
+        # 8. Respon. Shift
+        c8 = tk.Frame(row_frame, width=self.col_widths.get("shift", 105), height=38)
+        c8.pack(side=tk.LEFT, padx=0)
+        c8.pack_propagate(False)
+        row_frame._cells["shift"] = c8
+        cell_frames.append(c8)
+        l8 = tk.Label(c8, font=("Segoe UI", 9, "bold"))
+        l8.pack(fill=tk.BOTH, expand=True)
+        bind_select(l8)
+        sp8 = tk.Frame(row_frame, width=5, height=38)
+        sp8.pack(side=tk.LEFT, fill=tk.Y)
+        cell_frames.append(sp8)
+
+        # 9. Line
+        c9 = tk.Frame(row_frame, width=self.col_widths.get("line", 85), height=38)
+        c9.pack(side=tk.LEFT, padx=0)
+        c9.pack_propagate(False)
+        row_frame._cells["line"] = c9
+        cell_frames.append(c9)
+        l9 = tk.Label(c9, font=("Segoe UI", 9, "bold"))
+        l9.pack(fill=tk.BOTH, expand=True)
+        bind_select(l9)
+
+        row_frame._widget_refs = {
+            'cell_frames': cell_frames,
+            'l0': l0, 'l1': l1, 'l2': l2, 'l3': l3,
+            'f_btn_box': f_btn_box, 'btn_f': btn_f, 'btn_el': btn_el, 'btn_b': btn_b,
+            'btn_mr': btn_mr, 'l6': l6, 'l7': l7, 'l8': l8, 'l9': l9
+        }
+
+        self._update_row_widgets(row_frame, rec, idx)
+        return row_frame
+
+    def _update_row_widgets(self, row_frame, rec, idx):
+        is_selected = (rec.get('id') == self.selected_rec_id)
+        
+        # Check if this row has been worked on / processed
+        def_photo = rec.get('photo_path')
+        is_def_snip = bool(def_photo and ("Snip_" in os.path.basename(def_photo) or rec.get('snip_saved')))
+        has_pre_snip = bool(rec.get('pre_el_snip_path') and os.path.exists(rec.get('pre_el_snip_path', '')))
+        has_summary = bool(rec.get('summary') and str(rec.get('summary')).strip() not in ("-", "None", ""))
+        has_grade = bool(rec.get('result') and str(rec.get('result')).strip() not in ("-", "None", ""))
+        is_worked = bool(rec.get('worked_on') or is_def_snip or has_pre_snip or has_summary or has_grade)
+
+        if is_selected:
+            row_bg = "#dbeafe"  # Active selection highlight (soft sky blue)
+            border_col = "#2563eb"
+            border_thick = 2
+        elif is_worked:
+            row_bg = "#f0fdf4" if idx % 2 == 0 else "#ecfdf5"  # Soft mint/emerald highlight for worked rows
+            border_col = "#10b981"
+            border_thick = 1
+        else:
+            row_bg = "#ffffff" if idx % 2 == 0 else "#f8fafc"  # Standard alternating for pending rows
+            border_col = "#e2e8f0"
+            border_thick = 1
+
+        w = getattr(row_frame, '_widget_refs', {})
+        row_frame.config(bg=row_bg, highlightbackground=border_col, highlightthickness=border_thick)
+        
+        for cf in w.get('cell_frames', []):
+            cf.config(bg=row_bg)
+
+        # 0. Date
+        date_icon = "✓ " if is_worked else ""
+        date_fg = "#047857" if (is_worked and not is_selected) else ("#1e3a8a" if is_selected else "#334155")
+        w['l0'].config(text=f"{date_icon}{rec.get('date', '-')}", font=("Segoe UI", 9, "bold" if is_worked else "normal"), fg=date_fg, bg=row_bg)
+
+        # 1. SN
+        sn_fg = "#065f46" if (is_worked and not is_selected) else ("#1e3a8a" if is_selected else "#1e293b")
+        w['l1'].config(text=rec.get('sn', '-'), fg=sn_fg, bg=row_bg)
+
+        # 2. Defect Summary
+        w['l2'].config(text=rec.get('summary') or "-", bg=row_bg)
+
+        # 3. Grade (Q3 / Scrap)
+        res_val = str(rec.get('result', '') or '').strip()
+        if res_val in ("-", "None"): res_val = ""
+        if "SCRAP" in res_val.upper():
+            w['l3'].config(text=res_val, font=("Segoe UI", 9, "bold"), bg="#fee2e2", fg="#dc2626")
+        elif "Q3" in res_val.upper():
+            w['l3'].config(text=res_val, font=("Segoe UI", 9, "bold"), bg="#fef3c7", fg="#ca8a04")
+        else:
+            w['l3'].config(text=res_val, font=("Segoe UI", 9), bg=row_bg, fg="#64748b")
+
+        # 4. PreEL (Front, EL, Back)
+        views = rec.get('pre_el_views') or {}
+        front_info = views.get('front')
+        el_info = views.get('el')
+        back_info = views.get('back')
+        pre_snip = rec.get('pre_el_snip_path')
+        pre_view = str(rec.get('pre_el_snip_view', '')).lower()
+        snip_name = os.path.basename(pre_snip).lower() if pre_snip else ""
+
+        w['f_btn_box'].config(bg=row_bg)
+
+        # Front Button
+        if front_info and front_info.get('path'):
+            st = str(front_info.get('status', 'OK')).upper()
+            is_ng = (st == "NG" or st not in ("OK", "PASS", "GOOD", "NORMAL"))
+            has_snip = bool(pre_snip and os.path.exists(pre_snip) and (pre_view == 'front' or front_info.get('snip_path') or 'front' in snip_name))
+            btn_txt = "✂️ Front" if has_snip else "Front"
+            bg_col = "#dc2626" if is_ng else "#059669"
+            act_col = "#b91c1c" if is_ng else "#047857"
+            w['btn_f'].config(text=btn_txt, font=("Segoe UI", 8, "bold"), bg=bg_col, fg="#ffffff", activebackground=act_col, activeforeground="#ffffff", state="normal", cursor="hand2",
+                              command=lambda p=front_info['path'], r=rec: self.show_image_viewer("Pre-EL Front Image", p, record=r, image_category="PRE_EL_FRONT"))
+        else:
+            w['btn_f'].config(text="Front", font=("Segoe UI", 8), bg="#cbd5e1", fg="#64748b", state="disabled", cursor="")
+
+        # EL Button
+        if el_info and el_info.get('path'):
+            st = str(el_info.get('status', 'OK')).upper()
+            is_ng = (st == "NG" or st not in ("OK", "PASS", "GOOD", "NORMAL"))
+            has_snip = bool(pre_snip and os.path.exists(pre_snip) and (pre_view == 'el' or el_info.get('snip_path') or ('_el_' in snip_name or snip_name.endswith('_el.jpg'))))
+            btn_txt = "✂️ EL" if has_snip else "EL"
+            bg_col = "#dc2626" if is_ng else "#059669"
+            act_col = "#b91c1c" if is_ng else "#047857"
+            w['btn_el'].config(text=btn_txt, font=("Segoe UI", 8, "bold"), bg=bg_col, fg="#ffffff", activebackground=act_col, activeforeground="#ffffff", state="normal", cursor="hand2",
+                               command=lambda p=el_info['path'], r=rec: self.show_image_viewer("Pre-EL EL Image", p, record=r, image_category="PRE_EL_EL"))
+        else:
+            w['btn_el'].config(text="EL", font=("Segoe UI", 8), bg="#cbd5e1", fg="#64748b", state="disabled", cursor="")
+
+        # Back Button
+        if back_info and back_info.get('path'):
+            st = str(back_info.get('status', 'OK')).upper()
+            is_ng = (st == "NG" or st not in ("OK", "PASS", "GOOD", "NORMAL"))
+            has_snip = bool(pre_snip and os.path.exists(pre_snip) and (pre_view == 'back' or back_info.get('snip_path') or 'back' in snip_name))
+            btn_txt = "✂️ Back" if has_snip else "Back"
+            bg_col = "#dc2626" if is_ng else "#059669"
+            act_col = "#b91c1c" if is_ng else "#047857"
+            w['btn_b'].config(text=btn_txt, font=("Segoe UI", 8, "bold"), bg=bg_col, fg="#ffffff", activebackground=act_col, activeforeground="#ffffff", state="normal", cursor="hand2",
+                              command=lambda p=back_info['path'], r=rec: self.show_image_viewer("Pre-EL Back Image", p, record=r, image_category="PRE_EL_BACK"))
+        else:
+            w['btn_b'].config(text="Back", font=("Segoe UI", 8), bg="#cbd5e1", fg="#64748b", state="disabled", cursor="")
+
+        # 5. MR Defect Pic
+        def_photo = rec.get('photo_path')
+        if def_photo and os.path.exists(def_photo):
+            is_snip = "Snip_" in os.path.basename(def_photo) or rec.get('snip_saved')
+            btn_text = "✂️ Defect Snip" if is_snip else "📷 Defect Pic"
+            btn_bg = "#059669" if is_snip else "#2563eb"
+            btn_act = "#047857" if is_snip else "#1d4ed8"
+            w['btn_mr'].config(text=btn_text, font=("Segoe UI", 8, "bold"), bg=btn_bg, fg="#ffffff", activebackground=btn_act, activeforeground="#ffffff", state="normal", cursor="hand2",
+                               command=lambda p=def_photo, r=rec: self.show_image_viewer("MR Defect Photo", p, record=r, image_category="MR_DEFECT"))
+        else:
+            w['btn_mr'].config(text="No Pic", font=("Segoe UI", 8), bg="#e2e8f0", fg="#94a3b8", state="disabled", cursor="")
+
+        # 6. PreEL Time
+        val6 = rec.get('layup_time', '')
+        if val6 in ("-", "None", None): val6 = ""
+        w['l6'].config(text=val6, bg=row_bg)
+
+        # 7. Station
+        val7 = rec.get('station', '')
+        if val7 in ("-", "None", None): val7 = ""
+        w['l7'].config(text=val7, bg=row_bg)
+
+        # 8. Respon. Shift
+        val8 = rec.get('shift', '')
+        if val8 in ("-", "None", None): val8 = ""
+        w['l8'].config(text=val8, bg=row_bg)
+
+        # 9. Line
+        val9 = rec.get('line', '')
+        if val9 in ("-", "None", None): val9 = ""
+        w['l9'].config(text=val9, bg=row_bg)
+
+    def refresh_treeview(self):
         total_w = self.get_total_table_width()
         self.header_bar.config(width=total_w)
         self.rows_frame.config(width=total_w)
         self.table_inner.config(width=total_w)
 
-        for idx, rec in enumerate(self.records):
-            is_selected = (rec.get('id') == self.selected_rec_id)
-            
-            # Check if this row has been worked on / processed
-            def_photo = rec.get('photo_path')
-            is_def_snip = bool(def_photo and ("Snip_" in os.path.basename(def_photo) or rec.get('snip_saved')))
-            has_pre_snip = bool(rec.get('pre_el_snip_path') and os.path.exists(rec.get('pre_el_snip_path', '')))
-            has_summary = bool(rec.get('summary') and str(rec.get('summary')).strip() not in ("-", "None", ""))
-            has_grade = bool(rec.get('result') and str(rec.get('result')).strip() not in ("-", "None", ""))
-            is_worked = bool(rec.get('worked_on') or is_def_snip or has_pre_snip or has_summary or has_grade)
+        existing_frames = [w for w in self.rows_frame.winfo_children() if hasattr(w, '_rec_id')]
+        existing_ids = [getattr(w, '_rec_id', None) for w in existing_frames]
+        current_ids = [r.get('id') for r in self.records]
 
-            if is_selected:
-                row_bg = "#dbeafe"  # Active selection highlight (soft sky blue)
-                border_col = "#2563eb"
-                border_thick = 2
-            elif is_worked:
-                row_bg = "#f0fdf4" if idx % 2 == 0 else "#ecfdf5"  # Soft mint/emerald highlight for worked rows
-                border_col = "#10b981"
-                border_thick = 1
-            else:
-                row_bg = "#ffffff" if idx % 2 == 0 else "#f8fafc"  # Standard alternating for pending rows
-                border_col = "#e2e8f0"
-                border_thick = 1
+        if existing_ids == current_ids and len(existing_frames) == len(self.records):
+            for idx, (rec, row_frame) in enumerate(zip(self.records, existing_frames)):
+                self._update_row_widgets(row_frame, rec, idx)
+        else:
+            for widget in self.rows_frame.winfo_children():
+                widget.destroy()
 
-            row_frame = tk.Frame(self.rows_frame, bg=row_bg, height=40, width=total_w, highlightbackground=border_col, highlightthickness=border_thick)
-            row_frame.pack(anchor="nw", fill=tk.X, pady=1)
-            row_frame.pack_propagate(False)
-            row_frame._cells = {}
-
-            def bind_select(w, r=rec):
-                w.bind("<Button-1>", lambda e, rec_item=r: self.select_record(rec_item))
-
-            bind_select(row_frame)
-
-            # 0. Date
-            c0 = tk.Frame(row_frame, width=self.col_widths.get("date", 100), height=38, bg=row_bg)
-            c0.pack(side=tk.LEFT, padx=0)
-            c0.pack_propagate(False)
-            row_frame._cells["date"] = c0
-            date_icon = "✓ " if is_worked else ""
-            date_fg = "#047857" if (is_worked and not is_selected) else ("#1e3a8a" if is_selected else "#334155")
-            l0 = tk.Label(c0, text=f"{date_icon}{rec.get('date', '-')}", font=("Segoe UI", 9, "bold" if is_worked else "normal"), fg=date_fg, bg=row_bg)
-            l0.pack(fill=tk.BOTH, expand=True)
-            bind_select(l0)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 1. SN
-            c1 = tk.Frame(row_frame, width=self.col_widths.get("sn", 175), height=38, bg=row_bg)
-            c1.pack(side=tk.LEFT, padx=0)
-            c1.pack_propagate(False)
-            row_frame._cells["sn"] = c1
-            sn_fg = "#065f46" if (is_worked and not is_selected) else ("#1e3a8a" if is_selected else "#1e293b")
-            l1 = tk.Label(c1, text=rec.get('sn', '-'), font=("Segoe UI", 9, "bold"), fg=sn_fg, bg=row_bg)
-            l1.pack(fill=tk.BOTH, expand=True)
-            bind_select(l1)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 2. Defect Summary
-            c2 = tk.Frame(row_frame, width=self.col_widths.get("summary", 160), height=38, bg=row_bg)
-            c2.pack(side=tk.LEFT, padx=0)
-            c2.pack_propagate(False)
-            row_frame._cells["summary"] = c2
-            l2 = tk.Label(c2, text=rec.get('summary') or "-", font=("Segoe UI", 9), bg=row_bg)
-            l2.pack(fill=tk.BOTH, expand=True)
-            bind_select(l2)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 3. Grade (Q3 / Scrap)
-            c3 = tk.Frame(row_frame, width=self.col_widths.get("grade", 80), height=38, bg=row_bg)
-            c3.pack(side=tk.LEFT, padx=0)
-            c3.pack_propagate(False)
-            row_frame._cells["grade"] = c3
-            res_val = str(rec.get('result', '') or '').strip()
-            if res_val in ("-", "None"): res_val = ""
-            if "SCRAP" in res_val.upper():
-                l3 = tk.Label(c3, text=res_val, font=("Segoe UI", 9, "bold"), bg="#fee2e2", fg="#dc2626", padx=6, pady=2)
-            elif "Q3" in res_val.upper():
-                l3 = tk.Label(c3, text=res_val, font=("Segoe UI", 9, "bold"), bg="#fef3c7", fg="#ca8a04", padx=6, pady=2)
-            else:
-                l3 = tk.Label(c3, text=res_val, font=("Segoe UI", 9), bg=row_bg, fg="#64748b")
-            l3.pack(expand=True)
-            bind_select(l3)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 4. PreEL (3 Buttons: Front, EL, Back)
-            c4 = tk.Frame(row_frame, width=self.col_widths.get("pre_el", 210), height=38, bg=row_bg)
-            c4.pack(side=tk.LEFT, padx=0)
-            c4.pack_propagate(False)
-            row_frame._cells["pre_el"] = c4
-
-            views = rec.get('pre_el_views') or {}
-            front_info = views.get('front')
-            el_info = views.get('el')
-            back_info = views.get('back')
-            pre_snip = rec.get('pre_el_snip_path')
-            pre_view = str(rec.get('pre_el_snip_view', '')).lower()
-            snip_name = os.path.basename(pre_snip).lower() if pre_snip else ""
-
-            f_btn_box = tk.Frame(c4, bg=row_bg)
-            f_btn_box.pack(expand=True)
-
-            # Front Button (Preserve Red for NG, Green for OK, add ✂️ when snipped)
-            if front_info and front_info.get('path'):
-                st = str(front_info.get('status', 'OK')).upper()
-                is_ng = (st == "NG" or st not in ("OK", "PASS", "GOOD", "NORMAL"))
-                has_snip = bool(pre_snip and os.path.exists(pre_snip) and (pre_view == 'front' or front_info.get('snip_path') or 'front' in snip_name))
-                btn_txt = "✂️ Front" if has_snip else "Front"
-                bg_col = "#dc2626" if is_ng else "#059669"
-                act_col = "#b91c1c" if is_ng else "#047857"
-                btn_f = tk.Button(f_btn_box, text=btn_txt, font=("Segoe UI", 8, "bold"), bg=bg_col, fg="#ffffff", activebackground=act_col, activeforeground="#ffffff", relief=tk.FLAT, padx=4, pady=2, cursor="hand2",
-                                  command=lambda p=front_info['path'], r=rec: self.show_image_viewer("Pre-EL Front Image", p, record=r, image_category="PRE_EL_FRONT"))
-            else:
-                btn_f = tk.Button(f_btn_box, text="Front", font=("Segoe UI", 8), bg="#cbd5e1", fg="#64748b", relief=tk.FLAT, padx=4, pady=2, state="disabled")
-            btn_f.pack(side=tk.LEFT, padx=1)
-
-            # EL Button (Preserve Red for NG, Green for OK, add ✂️ when snipped)
-            if el_info and el_info.get('path'):
-                st = str(el_info.get('status', 'OK')).upper()
-                is_ng = (st == "NG" or st not in ("OK", "PASS", "GOOD", "NORMAL"))
-                has_snip = bool(pre_snip and os.path.exists(pre_snip) and (pre_view == 'el' or el_info.get('snip_path') or ('_el_' in snip_name or snip_name.endswith('_el.jpg'))))
-                btn_txt = "✂️ EL" if has_snip else "EL"
-                bg_col = "#dc2626" if is_ng else "#059669"
-                act_col = "#b91c1c" if is_ng else "#047857"
-                btn_el = tk.Button(f_btn_box, text=btn_txt, font=("Segoe UI", 8, "bold"), bg=bg_col, fg="#ffffff", activebackground=act_col, activeforeground="#ffffff", relief=tk.FLAT, padx=4, pady=2, cursor="hand2",
-                                   command=lambda p=el_info['path'], r=rec: self.show_image_viewer("Pre-EL EL Image", p, record=r, image_category="PRE_EL_EL"))
-            else:
-                btn_el = tk.Button(f_btn_box, text="EL", font=("Segoe UI", 8), bg="#cbd5e1", fg="#64748b", relief=tk.FLAT, padx=4, pady=2, state="disabled")
-            btn_el.pack(side=tk.LEFT, padx=1)
-
-            # Back Button (Preserve Red for NG, Green for OK, add ✂️ when snipped)
-            if back_info and back_info.get('path'):
-                st = str(back_info.get('status', 'OK')).upper()
-                is_ng = (st == "NG" or st not in ("OK", "PASS", "GOOD", "NORMAL"))
-                has_snip = bool(pre_snip and os.path.exists(pre_snip) and (pre_view == 'back' or back_info.get('snip_path') or 'back' in snip_name))
-                btn_txt = "✂️ Back" if has_snip else "Back"
-                bg_col = "#dc2626" if is_ng else "#059669"
-                act_col = "#b91c1c" if is_ng else "#047857"
-                btn_b = tk.Button(f_btn_box, text=btn_txt, font=("Segoe UI", 8, "bold"), bg=bg_col, fg="#ffffff", activebackground=act_col, activeforeground="#ffffff", relief=tk.FLAT, padx=4, pady=2, cursor="hand2",
-                                  command=lambda p=back_info['path'], r=rec: self.show_image_viewer("Pre-EL Back Image", p, record=r, image_category="PRE_EL_BACK"))
-            else:
-                btn_b = tk.Button(f_btn_box, text="Back", font=("Segoe UI", 8), bg="#cbd5e1", fg="#64748b", relief=tk.FLAT, padx=4, pady=2, state="disabled")
-            btn_b.pack(side=tk.LEFT, padx=1)
-
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 5. MR Defect Pic (Defect Picture / Snip)
-            c5 = tk.Frame(row_frame, width=self.col_widths.get("mr_pic", 125), height=38, bg=row_bg)
-            c5.pack(side=tk.LEFT, padx=0)
-            c5.pack_propagate(False)
-            row_frame._cells["mr_pic"] = c5
-
-            def_photo = rec.get('photo_path')
-            if def_photo and os.path.exists(def_photo):
-                is_snip = "Snip_" in os.path.basename(def_photo) or rec.get('snip_saved')
-                btn_text = "✂️ Defect Snip" if is_snip else "📷 Defect Pic"
-                btn_bg = "#059669" if is_snip else "#2563eb"
-                btn_act = "#047857" if is_snip else "#1d4ed8"
-                btn_mr = tk.Button(c5, text=btn_text, font=("Segoe UI", 8, "bold"), bg=btn_bg, fg="#ffffff", activebackground=btn_act, activeforeground="#ffffff", relief=tk.FLAT, padx=6, pady=2, cursor="hand2",
-                                   command=lambda p=def_photo, r=rec: self.show_image_viewer("MR Defect Photo", p, record=r, image_category="MR_DEFECT"))
-                btn_mr.pack(expand=True)
-            else:
-                btn_mr = tk.Button(c5, text="No Pic", font=("Segoe UI", 8), bg="#e2e8f0", fg="#94a3b8", relief=tk.FLAT, padx=6, pady=2, state="disabled")
-                btn_mr.pack(expand=True)
-
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 6. PreEL Time
-            c6 = tk.Frame(row_frame, width=self.col_widths.get("layup_time", 155), height=38, bg=row_bg)
-            c6.pack(side=tk.LEFT, padx=0)
-            c6.pack_propagate(False)
-            row_frame._cells["layup_time"] = c6
-            val6 = rec.get('layup_time', '')
-            if val6 in ("-", "None", None): val6 = ""
-            l6 = tk.Label(c6, text=val6, font=("Segoe UI", 9), bg=row_bg)
-            l6.pack(fill=tk.BOTH, expand=True)
-            bind_select(l6)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 7. Station
-            c7 = tk.Frame(row_frame, width=self.col_widths.get("station", 110), height=38, bg=row_bg)
-            c7.pack(side=tk.LEFT, padx=0)
-            c7.pack_propagate(False)
-            row_frame._cells["station"] = c7
-            val7 = rec.get('station', '')
-            if val7 in ("-", "None", None): val7 = ""
-            l7 = tk.Label(c7, text=val7, font=("Segoe UI", 9), bg=row_bg)
-            l7.pack(fill=tk.BOTH, expand=True)
-            bind_select(l7)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 8. Respon. Shift
-            c8 = tk.Frame(row_frame, width=self.col_widths.get("shift", 105), height=38, bg=row_bg)
-            c8.pack(side=tk.LEFT, padx=0)
-            c8.pack_propagate(False)
-            row_frame._cells["shift"] = c8
-            val8 = rec.get('shift', '')
-            if val8 in ("-", "None", None): val8 = ""
-            l8 = tk.Label(c8, text=val8, font=("Segoe UI", 9, "bold"), fg="#334155", bg=row_bg)
-            l8.pack(fill=tk.BOTH, expand=True)
-            bind_select(l8)
-            tk.Frame(row_frame, width=5, height=38, bg=row_bg).pack(side=tk.LEFT, fill=tk.Y)
-
-            # 9. Line
-            c9 = tk.Frame(row_frame, width=self.col_widths.get("line", 85), height=38, bg=row_bg)
-            c9.pack(side=tk.LEFT, padx=0)
-            c9.pack_propagate(False)
-            row_frame._cells["line"] = c9
-            val9 = rec.get('line', '')
-            if val9 in ("-", "None", None): val9 = ""
-            l9 = tk.Label(c9, text=val9, font=("Segoe UI", 9, "bold"), fg="#1d4ed8", bg=row_bg)
-            l9.pack(fill=tk.BOTH, expand=True)
-            bind_select(l9)
+            for idx, rec in enumerate(self.records):
+                self._create_row_frame(rec, idx, total_w)
 
         self.lbl_table_count.config(text=f"Total Records Reviewed: {len(self.records)}")
         self.app.global_review_records = self.records
         try:
-            self.rows_frame.update_idletasks()
-            self.table_inner.update_idletasks()
             self.table_canvas.configure(scrollregion=self.table_canvas.bbox("all"))
         except Exception:
             pass
@@ -1676,12 +2643,26 @@ class ModuleReviewTab(tk.Frame):
 
     def query_pre_el(self, sn, session_dt):
         pre_stations = [f"{config.PRE_EL_STATION_PREFIX}{i}" for i in range(config.PRE_EL_STATION_MIN, config.PRE_EL_STATION_MAX + 1)]
-        start_search = session_dt - timedelta(days=4)
-        end_search = session_dt + timedelta(days=1)
+        
+        # 1. Before getting time and station, check if MES has layup time for this SN
+        # Enables automatic detection of modules produced in prior months (e.g. 2am 8/14 -> window 8/13 to 8/15)
+        mes_dt, mes_station, mes_data = get_mes_layup_time_for_sn(sn)
+
+        if mes_dt:
+            # Search time frame based on day-1 to day+1 around actual production date
+            start_search = mes_dt.replace(hour=0, minute=0, second=0) - timedelta(days=1)
+            end_search = mes_dt.replace(hour=23, minute=59, second=59) + timedelta(days=1)
+            print(f"[MES SMART SEARCH]: SN '{sn}' MES Layup Time: {mes_dt.strftime('%Y-%m-%d %H:%M:%S')}. Searching Pre-EL window: {start_search.strftime('%Y-%m-%d')} to {end_search.strftime('%Y-%m-%d')}")
+        else:
+            days_back = getattr(config, 'DEFAULT_PRE_FINAL_DAYS_BACK_START', 4)
+            start_search = session_dt - timedelta(days=days_back)
+            end_search = session_dt + timedelta(days=1)
+            print(f"[PRE-EL DEFAULT SEARCH]: SN '{sn}' searching default {days_back} days back from {session_dt.strftime('%Y-%m-%d')}")
 
         try:
             results, _ = self.app.search_engine.search_pre_el(sn, pre_stations, start_search, end_search, max_results=100)
-        except Exception:
+        except Exception as e:
+            print(f"[PRE-EL SEARCH ENGINE ERROR]: {e}")
             results = []
 
         pre_el_views = {
@@ -1712,6 +2693,12 @@ class ModuleReviewTab(tk.Frame):
 
             return layup_dt.strftime("%Y-%m-%d %H:%M:%S"), station_found, line_str, shift_str, pre_el_views
         else:
+            # Fallback to MES data if images were not found on disk share
+            if mes_dt:
+                station_found = mes_station or (mes_data.get('tumlayup') if mes_data else '')
+                line_str, shift_str = get_responsible_shift_and_line(mes_dt, station_found)
+                print(f"[MES SMART FALLBACK]: Populating layup time {mes_dt} & station '{station_found}' (Line: {line_str}, Shift: {shift_str}) from MES.")
+                return mes_dt.strftime("%Y-%m-%d %H:%M:%S"), station_found, line_str, shift_str, pre_el_views
             return "", "", "", "", pre_el_views
 
     def query_pre_el_async(self, target_rec, sn, file_dt):
@@ -1779,12 +2766,15 @@ class ModuleReviewTab(tk.Frame):
             return
 
         if action == "SN_PHOTO" or extracted_sn:
-            sn = extracted_sn or ""
-            if not sn: return
+            raw_sn = extracted_sn or ""
+            sn = clean_and_validate_sn(raw_sn)
+            if not sn:
+                print(f"[REJECTED PHONE SN]: Discarded non-V01 barcode '{raw_sn}'")
+                return
 
             renamed_sn_path = rename_to_sn_pattern(file_path, "SN", sn)
             target_rec = self.find_or_create_panel_session("SN_PHOTO", file_dt, sn=sn, file_path=file_path)
-            eval_shift = "Day白" if 6 <= file_dt.hour < 18 else "Night夜"
+            eval_shift = get_evaluation_shift(file_dt)
 
             target_rec['sn'] = sn
             target_rec['order'] = sn[:9] if len(sn) >= 9 else sn
@@ -1804,12 +2794,31 @@ class ModuleReviewTab(tk.Frame):
             return
 
     def on_barcode_scanned(self):
-        sn = self.ent_sn.get().strip()
-        if not sn: return
+        raw_sn = self.ent_sn.get().strip()
+        if not raw_sn: return
+
+        sn = clean_and_validate_sn(raw_sn)
+        if not sn:
+            if "NEG" in raw_sn.upper() or "TSM" in raw_sn.upper() or "|" in raw_sn:
+                messagebox.showwarning(
+                    "Model Barcode Scanned",
+                    f"⚠️ You scanned the Model/Specification Barcode:\n'{raw_sn}'\n\n"
+                    "Please scan the Module Serial Number Barcode (begins with 'V01') located directly below it."
+                )
+            else:
+                messagebox.showwarning(
+                    "Invalid Serial Number",
+                    f"⚠️ '{raw_sn}' is not a valid Solar Module Serial Number.\n\n"
+                    "Module serial numbers must start with 'V01' (e.g. V01269003050237)."
+                )
+            self.ent_sn.delete(0, tk.END)
+            self.ent_sn.focus_set()
+            return
+
         now_dt = datetime.now()
 
         target_rec = self.find_or_create_panel_session("SN_PHOTO", now_dt, sn=sn)
-        eval_shift = "Day白" if 6 <= now_dt.hour < 18 else "Night夜"
+        eval_shift = get_evaluation_shift(now_dt)
 
         target_rec['sn'] = sn
         target_rec['order'] = sn[:9] if len(sn) >= 9 else sn
@@ -1854,7 +2863,7 @@ class ModuleReviewTab(tk.Frame):
             wb = openpyxl.Workbook()
             ws = wb.active
             headers = [
-                "Date", "Order No", "Serial No", "Defect Summary", "Classification", 
+                "Date", "Order No", "Serial No", "Defect Classification", "Defect Description", 
                 "Result", "Defect Cause", "Defect Location", "Root Cause", 
                 "Pre-Layup Photo", "Post-Layup Photo", "Layup Time", "Station", 
                 "Eval Shift", "Line", "Responsible Shift"
@@ -1867,18 +2876,26 @@ class ModuleReviewTab(tk.Frame):
                 return "" if s in ("-", "None", "Pending SN") else s
 
             for r_idx, rec in enumerate(self.records, start=2):
+                def_summary = _clean(rec.get('summary'))
+                def_class = _clean(rec.get('class'))
+                if not def_class and def_summary and hasattr(config, 'get_class_for_summary'):
+                    def_class = config.get_class_for_summary(def_summary)
+
                 ws.cell(row=r_idx, column=1, value=_clean(rec.get('date')))
                 ws.cell(row=r_idx, column=2, value=_clean(rec.get('order')))
                 ws.cell(row=r_idx, column=3, value=_clean(rec.get('sn')))
-                ws.cell(row=r_idx, column=4, value=_clean(rec.get('summary')))
-                ws.cell(row=r_idx, column=5, value=_clean(rec.get('class')))
+                ws.cell(row=r_idx, column=4, value=def_class)   # Column D: Defect Classification (不良归类)
+                ws.cell(row=r_idx, column=5, value=def_summary) # Column E: Defect Description (不良描述)
                 ws.cell(row=r_idx, column=6, value=_clean(rec.get('result')))
                 ws.cell(row=r_idx, column=7, value=_clean(rec.get('cause')))
+                ws.cell(row=r_idx, column=8, value=_clean(rec.get('location')))
+                ws.cell(row=r_idx, column=9, value=_clean(rec.get('pass_cause', '')))
                 ws.cell(row=r_idx, column=12, value=_clean(rec.get('layup_time')))
                 ws.cell(row=r_idx, column=13, value=_clean(rec.get('station')))
-                ws.cell(row=r_idx, column=14, value=_clean(rec.get('eval_shift')))
+                ws.cell(row=r_idx, column=14, value=get_evaluation_shift(rec.get('eval_shift') or rec.get('dt')))
                 ws.cell(row=r_idx, column=15, value=_clean(rec.get('line')))
                 ws.cell(row=r_idx, column=16, value=_clean(rec.get('shift')))
+                ws.row_dimensions[r_idx].height = 40
                 
                 # 1. Embed Pre-Layup Photo into Column J (PreEL snip from Front/EL/Back)
                 pre_photo = rec.get('pre_el_snip_path')
@@ -1894,14 +2911,12 @@ class ModuleReviewTab(tk.Frame):
                         _to_j = AnchorMarker(col=col_j + 1, colOff=pixels_to_EMU(-4), row=row_num + 1, rowOff=pixels_to_EMU(-4))
                         img_pre.anchor = TwoCellAnchor(editAs='twoCell', _from=_from_j, to=_to_j)
                         ws.add_image(img_pre)
-                        ws.row_dimensions[r_idx].height = 80
                     except Exception:
                         try:
                             img_pre = XLImage(pre_photo)
                             img_pre.width = 100
                             img_pre.height = 75
                             ws.add_image(img_pre, f"J{r_idx}")
-                            ws.row_dimensions[r_idx].height = 80
                         except Exception: pass
 
                 # 2. Embed Post-Layup Photo into Column K (MR Defect Photo / Snip)
@@ -1918,14 +2933,12 @@ class ModuleReviewTab(tk.Frame):
                         _to_k = AnchorMarker(col=col_k + 1, colOff=pixels_to_EMU(-4), row=row_num + 1, rowOff=pixels_to_EMU(-4))
                         img_post.anchor = TwoCellAnchor(editAs='twoCell', _from=_from_k, to=_to_k)
                         ws.add_image(img_post)
-                        ws.row_dimensions[r_idx].height = 80
                     except Exception:
                         try:
                             img_post = XLImage(photo_path)
                             img_post.width = 100
                             img_post.height = 75
                             ws.add_image(img_post, f"K{r_idx}")
-                            ws.row_dimensions[r_idx].height = 80
                         except Exception: pass
 
             ws.column_dimensions['J'].width = 18
@@ -1953,11 +2966,21 @@ class ModuleReviewTab(tk.Frame):
             if hasattr(config, 'save_persistent_settings'):
                 config.save_persistent_settings()
 
-        ok, msg = sync_to_master_excel(master_path, self.records)
-        if ok:
-            messagebox.showinfo("Master Report Synced", msg)
-        else:
-            messagebox.showerror("Master Sync Error", msg)
+        self.lbl_photo_status.config(text="⚡ Syncing records to Master Report in background...", fg="#38bdf8")
+        rec_snapshot = list(self.records)
+
+        def _bg_sync():
+            ok, msg = sync_to_master_excel(master_path, rec_snapshot)
+            def _done():
+                if ok:
+                    self.lbl_photo_status.config(text="✅ Master Report Synced Successfully!", fg="#10b981")
+                    messagebox.showinfo("Master Report Synced", msg)
+                else:
+                    self.lbl_photo_status.config(text="❌ Master Report Sync Failed!", fg="#ef4444")
+                    messagebox.showerror("Master Sync Error", msg)
+            self.root.after(0, _done)
+
+        threading.Thread(target=_bg_sync, daemon=True).start()
 
     def on_mobile_override(self, data):
         if not self.records: return
@@ -2384,8 +3407,12 @@ class TabContent(tk.Frame):
         self.lbl_summary.pack(side=tk.LEFT, pady=(2, 0))
 
         self.btn_export = ModernButton(row2, text="Export Excel", command=self.export_excel, primary=False)
-        self.btn_export.pack(side=tk.RIGHT, anchor=tk.S, padx=(0, 10))
+        self.btn_export.pack(side=tk.RIGHT, anchor=tk.S, padx=(0, 6))
         self.btn_export.config(state="disabled")
+
+        self.btn_export_imgs = ModernButton(row2, text="Export Images", command=self.export_images_to_folder, primary=False)
+        self.btn_export_imgs.pack(side=tk.RIGHT, anchor=tk.S, padx=(0, 10))
+        self.btn_export_imgs.config(state="disabled")
 
         self.btn_go = ModernButton(row2, text="Refresh Cache" if self.mode == "STRING_BLACK" else "Search", command=self.toggle_search, primary=True)
         self.btn_go.pack(side=tk.RIGHT, anchor=tk.S)
@@ -2449,33 +3476,239 @@ class TabContent(tk.Frame):
         else: self.app.start_search_for_tab(self)
 
     def _show_single_sn_results(self, sn):
+        self.app.highlight_sidebar_sn(self, sn)
         results = self.current_results.get(sn, [])
         for w in self.result_container.winfo_children(): w.destroy()
         if not results:
             tk.Label(self.result_container, text=f"No data found for {sn}", font=config.FONT_TITLE, bg=config.COLOR_BG_MAIN, fg=config.COLOR_STATUS_NG).pack(pady=40)
             return
+
         groups = self.app.search_engine.group_by_timestamp(results)
-        for timestamp, images in groups.items():
-            frame_header = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
-            frame_header.pack(fill=tk.X, pady=(8, 2))
-            tk.Label(frame_header, text=f"{sn}  •  {timestamp}", font=config.FONT_SUBTITLE, bg=config.COLOR_BG_MAIN, fg=config.COLOR_PRIMARY).pack(side=tk.LEFT, padx=10)
-            grid = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
-            grid.pack(fill=tk.X, pady=(0, 6), padx=5)
-            
-            num_cols = min(3, max(1, len(images)))
-            for idx, img in enumerate(images):
-                row = idx // 3
-                col = idx % 3
-                card = ResultCard(grid, img, self.app.open_image)
-                card.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
-            for c in range(num_cols):
-                grid.grid_columnconfigure(c, weight=1, uniform="card_col")
+        timestamps = list(groups.keys())
+        pass_count = len(timestamps)
+
+        latest_ts = timestamps[0] if timestamps else "N/A"
+        latest_imgs = groups.get(latest_ts, [])
+
+        # 1. Top Header Banner with SN, Latest Inspection Time, and Passed Count Badge
+        header_card = tk.Frame(self.result_container, bg="#ffffff", bd=1, relief=tk.SOLID, padx=14, pady=10)
+        header_card.pack(fill=tk.X, pady=(6, 12), padx=4)
+
+        top_info = tk.Frame(header_card, bg="#ffffff")
+        top_info.pack(fill=tk.X)
+
+        tk.Label(top_info, text=f"{sn}", font=("Segoe UI", 13, "bold"), bg="#ffffff", fg=config.COLOR_PRIMARY).pack(side=tk.LEFT)
+        tk.Label(top_info, text=f"  •  Last Upload: {latest_ts}", font=("Segoe UI", 11, "bold"), bg="#ffffff", fg="#334155").pack(side=tk.LEFT, padx=(6, 0))
+
+        # Pass Count Badge (e.g. "Passed Station: 7 times" or "Passed Station: 1 time")
+        badge_text = f"🎯 Passed Station: {pass_count} {'times' if pass_count != 1 else 'time'}"
+        badge_bg = "#fef3c7" if pass_count > 1 else "#dcfce7"
+        badge_fg = "#b45309" if pass_count > 1 else "#15803d"
+
+        lbl_badge = tk.Label(top_info, text=f"  {badge_text}  ", font=("Segoe UI", 10, "bold"), bg=badge_bg, fg=badge_fg, bd=1, relief=tk.SOLID)
+        lbl_badge.pack(side=tk.RIGHT)
+
+        # 2. Section for Latest Inspection Cards (Front, EL, Back for Pre EL; EL for Final EL)
+        latest_section = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
+        latest_section.pack(fill=tk.X, pady=(0, 8), padx=2)
+
+        lbl_section = tk.Label(latest_section, text=f"LATEST INSPECTION RUN ({latest_ts})", font=("Segoe UI", 9, "bold"), bg=config.COLOR_BG_MAIN, fg="#64748b")
+        lbl_section.pack(anchor="w", padx=6, pady=(0, 4))
+
+        grid = tk.Frame(latest_section, bg=config.COLOR_BG_MAIN)
+        grid.pack(fill=tk.X, pady=(0, 6), padx=4)
+
+        num_cols = min(3, max(1, len(latest_imgs)))
+        for idx, img in enumerate(latest_imgs):
+            row = idx // 3
+            col = idx % 3
+            card = ResultCard(grid, img, self.app.open_original_image)
+            card.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
+        for c in range(num_cols):
+            grid.grid_columnconfigure(c, weight=1, uniform="card_col")
+
+        # 3. Optional expandable history container if there are multiple historical runs
+        if pass_count > 1:
+            history_container = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
+            history_container.pack(fill=tk.X, pady=(8, 4), padx=2)
+
+            history_content = tk.Frame(history_container, bg=config.COLOR_BG_MAIN)
+            history_shown = [False]
+
+            def toggle_history(btn_toggle=None):
+                if history_shown[0]:
+                    history_content.pack_forget()
+                    history_shown[0] = False
+                    if btn_toggle: btn_toggle.config(text=f"🕒 Show All {pass_count} Historical Passes ▼")
+                else:
+                    for w in history_content.winfo_children(): w.destroy()
+                    for ts_idx, ts in enumerate(timestamps[1:], start=2):
+                        imgs = groups[ts]
+                        f_head = tk.Frame(history_content, bg=config.COLOR_BG_MAIN)
+                        f_head.pack(fill=tk.X, pady=(10, 2))
+                        tk.Label(f_head, text=f"Pass #{pass_count - ts_idx + 1}  •  {ts}", font=("Segoe UI", 10, "bold"), bg=config.COLOR_BG_MAIN, fg="#475569").pack(side=tk.LEFT, padx=6)
+                        
+                        h_grid = tk.Frame(history_content, bg=config.COLOR_BG_MAIN)
+                        h_grid.pack(fill=tk.X, pady=(0, 6), padx=4)
+                        h_cols = min(3, max(1, len(imgs)))
+                        for idx, img in enumerate(imgs):
+                            r = idx // 3
+                            c = idx % 3
+                            card = ResultCard(h_grid, img, self.app.open_original_image)
+                            card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+                        for c in range(h_cols):
+                            h_grid.grid_columnconfigure(c, weight=1, uniform="card_col")
+                    
+                    history_content.pack(fill=tk.X, pady=(4, 10))
+                    history_shown[0] = True
+                    if btn_toggle: btn_toggle.config(text=f"▲ Hide Previous Passes")
+                    self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
+
+            btn_hist = ModernButton(history_container, text=f"🕒 Show All {pass_count} Historical Passes ▼", command=lambda: toggle_history(btn_hist), primary=False, padx=10, pady=4)
+            btn_hist.pack(anchor="w", padx=6, pady=4)
 
     def render_string_black_dashboard(self):
         pass
 
     def export_excel(self):
-        pass
+        if not self.current_results or not any(self.current_results.values()):
+            messagebox.showwarning("Export Excel", "No search results available to export!")
+            return
+
+        default_name = f"Pre_EL_Last_EL_Time_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx" if self.mode == "PRE_EL" else f"Final_EL_Last_EL_Time_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Files", "*.xlsx")],
+            title=f"Export {self.mode.replace('_', ' ')} Last EL Time to Excel"
+        )
+        if not filename:
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Pre EL Results" if self.mode == "PRE_EL" else "Final EL Results"
+
+            # 4 Standard ABCD Columns: Date, Serial No, Last EL Time, Station
+            headers = ["Date", "Serial No", "Last EL Time", "Station"]
+            ws.append(headers)
+            ws.row_dimensions[1].height = 26
+
+            header_fill = PatternFill(start_color="1A5B82", end_color="1A5B82", fill_type="solid")
+            header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+            thin_border = Border(
+                left=Side(style='thin', color='E2E8F0'),
+                right=Side(style='thin', color='E2E8F0'),
+                top=Side(style='thin', color='E2E8F0'),
+                bottom=Side(style='thin', color='E2E8F0')
+            )
+
+            for col_idx in range(1, 5):
+                c = ws.cell(row=1, column=col_idx)
+                c.fill = header_fill
+                c.font = header_font
+                c.alignment = Alignment(horizontal="center", vertical="center")
+
+            ordered_sns = self.sn_list_ordered if self.sn_list_ordered else list(self.current_results.keys())
+            r_idx = 2
+
+            for sn in ordered_sns:
+                img_list = self.current_results.get(sn, [])
+                if not img_list:
+                    ws.cell(row=r_idx, column=1, value="-")
+                    ws.cell(row=r_idx, column=2, value=sn)
+                    c_stat = ws.cell(row=r_idx, column=3, value="No Record")
+                    c_stat.font = Font(name="Segoe UI", size=9, italic=True, color="64748B")
+                    ws.cell(row=r_idx, column=4, value="-")
+                    ws.row_dimensions[r_idx].height = 24
+                    for c in range(1, 5):
+                        cell_obj = ws.cell(row=r_idx, column=c)
+                        cell_obj.border = thin_border
+                        cell_obj.alignment = Alignment(horizontal="center", vertical="center")
+                    r_idx += 1
+                    continue
+
+                groups = self.app.search_engine.group_by_timestamp(img_list)
+                latest_ts = list(groups.keys())[0] if groups else ""
+                latest_imgs = groups.get(latest_ts, [])
+
+                # Pick EL image or any image from latest inspection run
+                el_img = next((img for img in latest_imgs if "el" in str(img.get('category', '')).lower()), None)
+                if not el_img and latest_imgs:
+                    el_img = latest_imgs[0]
+
+                dt_val = el_img.get('datetime') if el_img else None
+                date_str = dt_val.strftime('%Y-%m-%d') if dt_val else (latest_ts.split(' ')[0] if ' ' in latest_ts else "-")
+                time_str = dt_val.strftime('%Y-%m-%d %H:%M:%S') if dt_val else latest_ts
+                st_val = el_img.get('station', '') if el_img else ""
+
+                ws.cell(row=r_idx, column=1, value=date_str)
+                ws.cell(row=r_idx, column=2, value=sn)
+                ws.cell(row=r_idx, column=3, value=time_str)
+                ws.cell(row=r_idx, column=4, value=st_val)
+                ws.row_dimensions[r_idx].height = 24
+
+                for c in range(1, 5):
+                    cell_obj = ws.cell(row=r_idx, column=c)
+                    cell_obj.border = thin_border
+                    cell_obj.alignment = Alignment(horizontal="center", vertical="center")
+                    cell_obj.font = Font(name="Segoe UI", size=9)
+
+                r_idx += 1
+
+            ws.column_dimensions['A'].width = 16
+            ws.column_dimensions['B'].width = 24
+            ws.column_dimensions['C'].width = 24
+            ws.column_dimensions['D'].width = 18
+
+            wb.save(filename)
+            messagebox.showinfo("Export Excel", f"Successfully exported Last EL Time (Columns A-D) for {len(ordered_sns)} SNs to:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export Excel report:\n{e}")
+
+    def export_images_to_folder(self):
+        if not self.current_results or not any(self.current_results.values()):
+            messagebox.showwarning("Export Images", "No search results available to export!")
+            return
+
+        dest_folder = filedialog.askdirectory(title="Select Destination Folder for Exported Images")
+        if not dest_folder:
+            return
+
+        try:
+            import shutil
+            copied_count = 0
+            for sn, img_list in self.current_results.items():
+                if not img_list: continue
+                for img in img_list:
+                    src_path = img.get('path')
+                    if src_path and os.path.exists(src_path):
+                        fname = os.path.basename(src_path)
+                        dst_name = f"{sn}_{fname}" if sn not in fname else fname
+                        dst_path = os.path.join(dest_folder, dst_name)
+                        
+                        if os.path.exists(dst_path):
+                            base, ext = os.path.splitext(dst_name)
+                            dst_path = os.path.join(dest_folder, f"{base}_{copied_count+1}{ext}")
+
+                        shutil.copy2(src_path, dst_path)
+                        copied_count += 1
+
+            if copied_count > 0:
+                resp = messagebox.askyesno(
+                    "Export Complete",
+                    f"Successfully copied {copied_count} images to:\n{dest_folder}\n\nDo you want to open the destination folder now?"
+                )
+                if resp:
+                    os.startfile(dest_folder)
+            else:
+                messagebox.showinfo("Export", "No image files found to copy.")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export images:\n{e}")
 
 # =================== MAIN APPLICATION ===================
 
@@ -2500,7 +3733,11 @@ class AOIDashboardApp:
         self.incoming_event_queue = queue.Queue()
         self.setup_styles()
         self.setup_layout()
-        self.phone_server_url = start_phone_server(self.on_phone_photo_uploaded, defect_callback=self.on_mobile_defect_logged)
+        self.phone_server_url = start_phone_server(
+            self.on_phone_photo_uploaded,
+            defect_callback=self.on_mobile_defect_logged,
+            mes_callback=self.on_mes_record_logged
+        )
 
         for tab in self.all_tabs:
             if isinstance(tab, ModuleReviewTab):
@@ -2510,6 +3747,9 @@ class AOIDashboardApp:
                     tab.update_qr_code(self.phone_server_url)
         self.check_midnight_rollover()
         self._poll_incoming_events()
+
+    def on_mes_record_logged(self, data):
+        self.incoming_event_queue.put(('MES_LOG', data))
 
     def on_mobile_defect_logged(self, data):
         self.incoming_event_queue.put(('DEFECT', data))
@@ -2531,11 +3771,19 @@ class AOIDashboardApp:
         try:
             while not self.incoming_event_queue.empty():
                 evt_type, data = self.incoming_event_queue.get_nowait()
-                for tab in self.all_tabs:
-                    if isinstance(tab, ModuleReviewTab):
-                        if evt_type == 'DEFECT':
+                if evt_type == 'MES_LOG':
+                    for tab in self.all_tabs:
+                        if isinstance(tab, MESProcessLogTab):
+                            tab.handle_incoming_mes_record(data)
+                            break
+                elif evt_type == 'DEFECT':
+                    for tab in self.all_tabs:
+                        if isinstance(tab, ModuleReviewTab):
                             tab.handle_mobile_defect_logged(data)
-                        elif evt_type == 'PHOTO':
+                            break
+                elif evt_type == 'PHOTO':
+                    for tab in self.all_tabs:
+                        if isinstance(tab, ModuleReviewTab):
                             tab.handle_incoming_phone_upload(
                                 data.get('file_path'),
                                 data.get('extracted_sn'),
@@ -2547,7 +3795,7 @@ class AOIDashboardApp:
                                 data.get('audio_path', ''),
                                 data.get('file_dt')
                             )
-                        break
+                            break
         except Exception as e:
             print(f"[EVENT POLL ERROR]: {e}")
         finally:
@@ -2617,7 +3865,9 @@ class AOIDashboardApp:
         ModernButton(top_bar, text="+ Final EL Tab", command=lambda: self.add_new_tab("FINAL_EL"), primary=False, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
         ModernButton(top_bar, text="+ String Black Tab", command=lambda: self.add_new_tab("STRING_BLACK"), primary=False, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
         ModernButton(top_bar, text="+ Module Review", command=self.add_defect_review_tab, primary=True, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
-        ModernButton(top_bar, text="+ Top 5 Analytics", command=self.add_analytics_tab, primary=False, padx=8, pady=3).pack(side=tk.LEFT)
+        ModernButton(top_bar, text="+ Top 5 Analytics", command=self.add_analytics_tab, primary=False, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
+        ModernButton(top_bar, text="+ MES Process Log", command=self.add_mes_log_tab, primary=False, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
+        ModernButton(top_bar, text="🇨🇳 Chinese MES Guide", command=self.open_chinese_mes_guide, primary=False, padx=8, pady=3).pack(side=tk.LEFT)
         ModernButton(top_bar, text="Close Tab", command=self.close_current_tab, primary=False, padx=10, pady=3).pack(side=tk.RIGHT)
 
         self.main_notebook = ttk.Notebook(self.content)
@@ -2629,6 +3879,7 @@ class AOIDashboardApp:
         self.add_new_tab("STRING_BLACK")
         self.add_defect_review_tab()
         self.add_analytics_tab()
+        self.add_mes_log_tab()
         
         self.tab_config = ConfigPanel(self.main_notebook, self)
         self.main_notebook.add(self.tab_config, text="  Config  ")
@@ -2653,11 +3904,18 @@ class AOIDashboardApp:
         self.all_tabs.append(tab)
         self._insert_tab_before_config(tab, "Module Review")
 
-
     def add_analytics_tab(self):
         tab = Top5AnalyticsTab(self.main_notebook, self)
         self.all_tabs.append(tab)
         self._insert_tab_before_config(tab, "Top 5 & Scrap Analytics")
+
+    def add_mes_log_tab(self):
+        tab = MESProcessLogTab(self.main_notebook, self)
+        self.all_tabs.append(tab)
+        self._insert_tab_before_config(tab, "MES Process Log")
+
+    def open_chinese_mes_guide(self):
+        MESChineseFieldGuideDialog(self.root)
 
     def close_current_tab(self):
         current_id = self.main_notebook.select()
@@ -2682,18 +3940,75 @@ class AOIDashboardApp:
         else:
             self.lbl_sn_nav_title.config(text="Dashboard Mode")
 
+    def highlight_sidebar_sn(self, tab, active_sn):
+        tab.active_displayed_sn = active_sn
+        if not hasattr(self, 'sidebar_sn_buttons') or not self.sidebar_sn_buttons:
+            return
+
+        for sn, item in self.sidebar_sn_buttons.items():
+            btn = item.get('btn')
+            if not btn or not btn.winfo_exists(): continue
+            is_found = item.get('is_found', True)
+            base_txt = item.get('txt', sn)
+
+            if sn == active_sn:
+                btn.config(
+                    text=f"▶{base_txt}",
+                    bg=config.COLOR_PRIMARY,
+                    fg="#ffffff",
+                    activebackground="#154c6d",
+                    activeforeground="#ffffff",
+                    font=("Segoe UI", 9, "bold"),
+                    relief=tk.FLAT
+                )
+                try:
+                    btn_y = btn.winfo_y()
+                    total_h = self.sidebar_nav_content.winfo_height()
+                    if total_h > 0 and btn_y > 0:
+                        frac = max(0.0, min(1.0, (btn_y - 20) / total_h))
+                        self.sidebar_nav_canvas.yview_moveto(frac)
+                except Exception: pass
+            else:
+                btn.config(
+                    text=base_txt,
+                    bg=config.COLOR_INPUT_BG if is_found else "#fff0f0",
+                    fg=config.COLOR_TEXT_MAIN if is_found else config.COLOR_STATUS_NG,
+                    activebackground="#e2e8f0",
+                    activeforeground=config.COLOR_TEXT_MAIN,
+                    font=("Segoe UI", 9, "bold"),
+                    relief=tk.FLAT
+                )
+
     def refresh_sidebar_for_tab(self, tab):
         for w in self.sidebar_nav_content.winfo_children(): w.destroy()
+        self.sidebar_sn_buttons = {}
         ordered_sns = getattr(tab, 'sn_list_ordered', [])
         all_results = getattr(tab, 'current_results', {})
         self.lbl_sn_nav_title.config(text=f"Serial Numbers ({len(ordered_sns)})")
         if not ordered_sns: return
         found_sns = [sn for sn, res in all_results.items() if res]
+        active_sn = getattr(tab, 'active_displayed_sn', None)
+        if not active_sn and found_sns:
+            active_sn = found_sns[0]
+
         for sn in ordered_sns:
             is_found = sn in found_sns
-            txt = f" {sn} ({len(all_results.get(sn, []))})" if is_found else f" {sn} (0)"
+            if is_found:
+                res = all_results.get(sn, [])
+                groups = self.search_engine.group_by_timestamp(res)
+                p_cnt = len(groups)
+                txt = f" {sn} ({p_cnt} {'passes' if p_cnt != 1 else 'pass'})"
+            else:
+                txt = f" {sn} (0)"
             btn = tk.Button(self.sidebar_nav_content, text=txt, font=("Segoe UI", 9, "bold"), bg=config.COLOR_INPUT_BG if is_found else "#fff0f0", fg=config.COLOR_TEXT_MAIN if is_found else config.COLOR_STATUS_NG, anchor="w", relief=tk.FLAT, bd=0, padx=8, pady=4, cursor="hand2", command=lambda s=sn: tab._show_single_sn_results(s))
             btn.pack(fill=tk.X, pady=2, padx=4)
+            self.sidebar_sn_buttons[sn] = {
+                'btn': btn,
+                'is_found': is_found,
+                'txt': txt
+            }
+
+        self.highlight_sidebar_sn(tab, active_sn)
         self.root.update_idletasks()
         self.sidebar_nav_canvas.config(scrollregion=self.sidebar_nav_canvas.bbox("all"))
 
@@ -2713,6 +4028,8 @@ class AOIDashboardApp:
         tab.results_canvas.yview_moveto(0)
         tab.lbl_summary.config(text="")
         tab.btn_export.config(state="disabled")
+        if hasattr(tab, 'btn_export_imgs'):
+            tab.btn_export_imgs.config(state="disabled")
         tab.progress_bar = ttk.Progressbar(tab.result_container, mode='determinate', length=350)
         tab.progress_bar.pack(pady=(40, 10))
         
@@ -2736,22 +4053,31 @@ class AOIDashboardApp:
                     if isinstance(w, ttk.Progressbar): w.destroy()
             except Exception: pass
 
-    def _update_progress(self, tab, curr, total, msg):
+    def _update_overall_progress(self, tab, curr_sn_idx, total_sns, current_sn):
         try:
             if hasattr(tab, 'progress_bar') and tab.progress_bar.winfo_exists():
-                tab.progress_bar['maximum'], tab.progress_bar['value'] = total, curr
+                tab.progress_bar['maximum'] = total_sns
+                tab.progress_bar['value'] = curr_sn_idx
+            if hasattr(tab, 'lbl_summary'):
+                tab.lbl_summary.config(text=f"Searching SN {curr_sn_idx}/{total_sns}: {current_sn}")
         except Exception: pass
 
     def _run_search(self, tab, sn_list, start, end, stations_list, search_id):
         if search_id != self.search_id: return
         all_results = {}
-        self.search_engine.set_progress_callback(lambda c, t, m: self.root.after(0, lambda: self._update_progress(tab, c, t, m)))
-        for sn in sn_list:
+        total_sns = len(sn_list)
+        for idx, sn in enumerate(sn_list):
             if self.search_engine.cancel_flag.is_set() or search_id != self.search_id: break
+            self.root.after(0, lambda i=idx, s=sn: self._update_overall_progress(tab, i + 1, total_sns, s))
+            sn_start, sn_end = start, end
             if tab.mode == "PRE_EL":
-                res, _ = self.search_engine.search_pre_el(sn, stations_list, start, end, max_results=config.MAX_IMAGES_PER_SN)
+                mes_dt, _, _ = get_mes_layup_time_for_sn(sn)
+                if mes_dt and (mes_dt < start or mes_dt > end):
+                    sn_start = mes_dt.replace(hour=0, minute=0, second=0) - timedelta(days=1)
+                    sn_end = mes_dt.replace(hour=23, minute=59, second=59) + timedelta(days=1)
+                res, _ = self.search_engine.search_pre_el(sn, stations_list, sn_start, sn_end, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
             else:
-                res, _ = self.search_engine.search_final_el(sn, stations_list, start, end, max_results=config.MAX_IMAGES_PER_SN)
+                res, _ = self.search_engine.search_final_el(sn, stations_list, start, end, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
             all_results[sn] = res
         self.root.after(0, lambda: self._display_results(tab, all_results, search_id))
 
@@ -2765,12 +4091,30 @@ class AOIDashboardApp:
         if not all_results:
             tk.Label(tab.result_container, text="No results found", font=config.FONT_SUBTITLE, bg=config.COLOR_BG_MAIN, fg=config.COLOR_TEXT_SECONDARY).pack(pady=40)
             return
-        tab.btn_export.config(state="normal", text=f"Export ({len(all_results)})")
         found_sns = [sn for sn, res in all_results.items() if res]
-        tab.lbl_summary.config(text=f"Found: {sum(len(res) for res in all_results.values())} Imgs across {len(found_sns)} SNs")
+        total_imgs = sum(len(res) for res in all_results.values())
+        total_passes = sum(len(self.search_engine.group_by_timestamp(res)) for res in all_results.values())
+        if found_sns:
+            tab.btn_export.config(state="normal", text=f"Export Excel ({len(found_sns)})")
+            if hasattr(tab, 'btn_export_imgs'):
+                tab.btn_export_imgs.config(state="normal", text=f"Export Images ({total_imgs})")
+        else:
+            tab.btn_export.config(state="disabled", text="Export Excel")
+            if hasattr(tab, 'btn_export_imgs'):
+                tab.btn_export_imgs.config(state="disabled", text="Export Images")
+        tab.lbl_summary.config(text=f"Found: {len(found_sns)}/{len(all_results)} SNs ({total_passes} passes • {total_imgs} imgs)")
         tab.sn_list_ordered = found_sns + [sn for sn in all_results if sn not in found_sns]
         self.refresh_sidebar_for_tab(tab)
         if found_sns: tab._show_single_sn_results(found_sns[0])
+
+    def open_original_image(self, path):
+        try:
+            if path and os.path.exists(path):
+                os.startfile(path)
+            else:
+                messagebox.showerror("Error", f"Image file not found:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open image file:\n{e}")
 
     def open_image(self, path):
         try:

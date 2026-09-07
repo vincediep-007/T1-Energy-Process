@@ -9,8 +9,10 @@ os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
 # Define dependent paths safely
 DAILY_CACHE_DIR = os.path.join(LOCAL_DATA_DIR, "DailyCache")
 VOICE_SAMPLES_DIR = os.path.join(LOCAL_DATA_DIR, "VoiceSamples")
+MES_PHOTOS_DIR = os.path.join(LOCAL_DATA_DIR, "mes_photos")
 os.makedirs(DAILY_CACHE_DIR, exist_ok=True)
 os.makedirs(VOICE_SAMPLES_DIR, exist_ok=True)
+os.makedirs(MES_PHOTOS_DIR, exist_ok=True)
 
 # Window & Theme Settings
 WINDOW_TITLE = "AOI & EL Dashboard - Production Suite v18.6"
@@ -94,7 +96,7 @@ ACTIVE_LINES = {
 }
 
 DEFAULT_PRE_FINAL_DAYS_BACK_START = 4
-MAX_IMAGES_PER_SN = 10
+MAX_IMAGES_PER_SN = 0  # 0 = Unlimited images per SN to capture all station passes
 TIME_INTERVAL_OPTIONS = ["1 Hour", "2 Hours", "4 Hours", "All Shift"]
 DEFAULT_TIME_INTERVAL = "2 Hours"
 CHART_ZOOM_OPTIONS = ["70%", "80%", "90%", "100%", "110%", "120%"]
@@ -103,19 +105,28 @@ MIN_NG_BLACK_PERCENT = 30.0
 
 # Full Comprehensive Factory Defect Tree Mapping
 DEFECT_TREE = {
-    "Backsheet Defect": ["Backsheet Defect", "Backsheet indentation", "Backsheet joint"],
-    "Bubble Defect": ["Bubble", "No melt"],
-    "Cells Defect": ["Cell Defect", "Crack Cells", "Cell color difference"],
-    "EL Defect": ["EL Defect", "EL broken grid", "EL uneven brightness", "EL shorted cell", "EL cold solder", "EL shaped microcrack"],
-    "Equipment Scrap": ["Equipment Scrap", "Busbar machine Scrap", "Conveyer line scrap", "Edge Trimming Scrap", "Fixture machine scrap", "Frame installation machine scrap", "Junction box machine scrap", "Laminator scrap", "Power outage Scrap", "Stringing machine scrap"],
-    "Foreign object Defect": ["Foreign object", "Cell fragments", "Desiccant", "Dirty in the module", "EVA label", "EVA seal strip", "Extra Busbar", "Extra ribbon", "Flux crystal", "Glass fragments", "Glass paper", "Insect", "Masking tape", "Paper object", "Positioning tape", "Small label", "Solding balls", "Teflon strip"],
-    "Glass Defect": ["Glass Defect", "Glass reversed", "Glass scratches", "Glass raw material", "Glass Missing", "Glass offset"],
-    "Missalignment Defect": ["Missalignment Defect", "String gap Defect", "Cell to Busbar Gap Defect", "Ribbon excess", "Creepage defect", "Cell gap defect"],
-    "Others Defects": ["Defect Label", "Tin exposure on busbar", "Static pattern", "Ribbon Not Cut"],
-    "Production Scrap": ["Production caused Scrap", "Rework causing scrap", "Warehousing scrap", "Turnover scrap"],
-    "Short Circuit Scrap": ["Shorted cell scrap", "Cell overlap scrap", "Ribbon overlap scrap", "Busbar misalignment or missing", "Two cell scrap"],
-    "Solder Defect": ["Solder Defect", "Ribbon offset", "No ribbon", "Busbar Offset"]
+    "Backsheet Defect 背板不良": ["Backsheet Defect", "Backsheet indentation", "Backsheet joint"],
+    "Bubble Defect 气泡不良": ["Bubble", "No melt"],
+    "Cells Defect 电池片不良": ["Cell Defect", "Crack Cells", "Cell color difference"],
+    "EL Defect EL不良": ["EL Defect", "EL broken grid", "EL uneven brightness", "EL shorted cell", "EL cold solder", "EL shaped microcrack"],
+    "Equipment Scrap 设备报废": ["Equipment Scrap", "Busbar machine Scrap", "Conveyer line scrap", "Edge Trimming machine Scrap", "Fixture machine scrap", "Frame installation machine scrap", "Junction box machine scrap", "Laminator machine scrap", "Power outage Scrap", "Stringing machine scrap"],
+    "Foreign material Defect 异物不良": ["Foreign material", "Cell fragments", "Desiccant", "Dirty in the module", "EVA label", "EVA seal strip", "Extra Busbar", "Extra ribbon", "Flux crystal", "Glass fragments", "Glass paper", "Insect", "Masking tape", "Paper object", "Positioning tape", "Small label", "Solding balls", "Teflon strip", "sawdust"],
+    "Glass Defect 玻璃不良": ["Glass Defect", "Glass reversed", "Glass scratches", "Glass raw material", "Glass Missing", "Glass offset"],
+    "Missalignment Defect 间距不良": ["间距不良 Cell Gap Defect", "String gap Defect", "Cell to Busbar Gap Defect", "Creepage by long ribbons", "Poor creepage distance", "Cells gap defect"],
+    "Others Defects 其它": ["Others Defects", "Tin exposure on busbar", "Static pattern", "Ribbon Not Cut", "Defect Label", "label offset"],
+    "Production Scrap 生产报废": ["Production caused Scrap", "Rework causing Scrapped", "Warehousing scrap", "Turnover scrap"],
+    "Short Circuit Scrap 短路报废": ["Shorted cell scrap", "Cell overlap scrap", "Ribbon overlap scrap", "Busbar misalignment or missing", "Two cell scrap"],
+    "Solder Defect 焊接不良": ["Solder Defect", "Ribbon offset", "No ribbon", "Busbar Offset"]
 }
+
+def get_class_for_summary(summary: str) -> str:
+    """Finds the parent classification for a given defect summary."""
+    if not summary: return ""
+    s_clean = summary.strip().lower()
+    for cls_name, items in DEFECT_TREE.items():
+        if s_clean in [it.lower() for it in items] or s_clean in cls_name.lower():
+            return cls_name
+    return ""
 
 # Phone Link, Mobile HUD & Mac Mini Relay Settings
 PHONE_CAMERA_DIR = ""

@@ -8,6 +8,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
+from shift_calculator import get_evaluation_shift
 
 def merge_exported_to_master(source_export_path: str, master_report_path: str) -> tuple:
     if not os.path.exists(source_export_path):
@@ -28,7 +29,7 @@ def merge_exported_to_master(source_export_path: str, master_report_path: str) -
             dst_ws = dst_wb.active
             dst_ws.title = "QC Daily Report"
             headers = [
-                "Date", "Order No", "Serial No", "Defect Summary", "Classification", 
+                "Date", "Order No", "Serial No", "Defect Classification", "Defect Description", 
                 "Result", "Defect Cause", "Defect Location", "Root Cause", 
                 "Pre-Layup Photo", "Post-Layup Photo", "Layup Time", "Station", 
                 "Eval Shift", "Line", "Responsible Shift"
@@ -65,6 +66,8 @@ def merge_exported_to_master(source_export_path: str, master_report_path: str) -
                 val = src_ws.cell(row=r, column=c).value
                 if val in ("-", "None", "Pending SN", None):
                     val = ""
+                elif c == 14 and val:
+                    val = get_evaluation_shift(val)
                 cell = dst_ws.cell(row=r_idx, column=c, value=val)
                 cell.border = thin_border
                 cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -98,12 +101,12 @@ def merge_exported_to_master(source_export_path: str, master_report_path: str) -
                     if is_col_j:
                         try:
                             dst_ws.add_image(img, f"J{r_idx}")
-                            dst_ws.row_dimensions[r_idx].height = 80
+                            dst_ws.row_dimensions[r_idx].height = 40
                         except Exception: pass
                     elif is_col_k:
                         try:
                             dst_ws.add_image(img, f"K{r_idx}")
-                            dst_ws.row_dimensions[r_idx].height = 80
+                            dst_ws.row_dimensions[r_idx].height = 40
                         except Exception: pass
 
             if sn and sn != "Pending SN":

@@ -1,9 +1,22 @@
 # =================== FINAL ROBUST PHONE SERVER ===================
 import os
 import sys
+
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import time
 import json
 import re
+import html
 import shutil
 import threading
 from datetime import datetime
@@ -55,10 +68,12 @@ except Exception:
 LOCAL_CACHE_DIR = getattr(config, 'DAILY_CACHE_DIR', os.path.join(config.LOCAL_DATA_DIR, "DailyCache"))
 VOICE_SAMPLES_DIR = getattr(config, 'VOICE_SAMPLES_DIR', os.path.join(config.LOCAL_DATA_DIR, "VoiceSamples"))
 LOCAL_UPLOADS_DIR = os.path.join(config.LOCAL_DATA_DIR, "PhoneUploads")
+MES_PHOTOS_DIR = getattr(config, 'MES_PHOTOS_DIR', os.path.join(config.LOCAL_DATA_DIR, "mes_photos"))
 
 os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 os.makedirs(VOICE_SAMPLES_DIR, exist_ok=True)
 os.makedirs(LOCAL_UPLOADS_DIR, exist_ok=True)
+os.makedirs(MES_PHOTOS_DIR, exist_ok=True)
 
 def find_phone_directories():
     """
@@ -256,19 +271,44 @@ def scan_and_train_from_sample_folders():
     return
 
 
-def decode_qr_robust(cv_img):
+def clean_and_validate_sn(raw_text: str) -> str:
+    """
+    Validates and extracts the real Solar Module Serial Number.
+    Per production standard, correct module SN ALWAYS begins with 'V01' (e.g. V01269003050237).
+    Discards adjacent model/specification barcodes (e.g. 615NEG19RC.20|Q1||003050237, TSM-615...).
+    """
+    if not raw_text:
+        return ""
+    raw_text = str(raw_text).strip()
+
+    # 1. Match 'V01' followed by 7-20 alphanumeric characters
+    m = re.search(r'\b(V01[0-9A-Za-z]{7,20})\b', raw_text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # 2. Match Trina Solar prefixed SNs e.g. "Trina Solar V01269003050237" or "SN: V01..."
+    m = re.search(r'(?:Trina\s*Solar\s*|SN:\s*|S/N:\s*)(V01[0-9A-Za-z]{7,20})', raw_text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # 3. Direct cleaned alphanumeric check
+    clean = re.sub(r'[^A-Za-z0-9]', '', raw_text).upper()
+    if clean.startswith("V01") and len(clean) >= 10:
+        return clean
+
+    return ""
+
+
+def decode_qr_robust(cv_img) -> str:
     if cv_img is None or cv_img.size == 0:
         return ""
     
     h, w = cv_img.shape[:2]
     
-    # Target widths: 800 and 1024 remove moire and high-frequency busbar grid noise
-    target_widths = [800, 1024, 1200, 600, w]
-    
-    for tw in target_widths:
-        if tw != w:
-            scale = tw / w
-            scaled = cv2.resize(cv_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
+    # Target scales: 1.0, 1.5, 2.0 to resolve small/dense QR codes
+    for scale in [1.0, 1.5, 2.0]:
+        if scale != 1.0:
+            scaled = cv2.resize(cv_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
         else:
             scaled = cv_img
             
@@ -283,25 +323,27 @@ def decode_qr_robust(cv_img):
             else:
                 rot = cv2.rotate(scaled, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 
-            # 1. PyZbar with specific symbols (QRCODE, CODE128, CODE39 - avoids pdf417/databar assertion warnings)
+            # 1. PyZbar with QRCODE, CODE128, CODE39
             if HAS_PYZBAR:
                 from pyzbar.pyzbar import ZBarSymbol
                 try:
                     for obj in pyzbar_decode(rot, symbols=[ZBarSymbol.QRCODE, ZBarSymbol.CODE128, ZBarSymbol.CODE39]):
-                        sn = obj.data.decode('utf-8', errors='ignore').strip()
-                        if sn and len(sn) >= 6:
+                        raw = obj.data.decode('utf-8', errors='ignore').strip()
+                        sn = clean_and_validate_sn(raw)
+                        if sn:
                             return sn
                 except Exception:
                     pass
 
-            # 2. PyZbar with light Gaussian blur (cleans up screen moire / LCD grid lines)
+            # 2. PyZbar with light Gaussian blur
             if HAS_PYZBAR:
                 from pyzbar.pyzbar import ZBarSymbol
                 try:
                     blurred = cv2.GaussianBlur(rot, (5, 5), 0)
                     for obj in pyzbar_decode(blurred, symbols=[ZBarSymbol.QRCODE, ZBarSymbol.CODE128, ZBarSymbol.CODE39]):
-                        sn = obj.data.decode('utf-8', errors='ignore').strip()
-                        if sn and len(sn) >= 6:
+                        raw = obj.data.decode('utf-8', errors='ignore').strip()
+                        sn = clean_and_validate_sn(raw)
+                        if sn:
                             return sn
                 except Exception:
                     pass
@@ -309,9 +351,18 @@ def decode_qr_robust(cv_img):
             # 3. OpenCV QRCodeDetector
             try:
                 detector = cv2.QRCodeDetector()
-                data, _, _ = detector.detectAndDecode(rot)
-                if data and len(data.strip()) >= 6:
-                    return data.strip()
+                ok, decoded_info, _, _ = detector.detectAndDecodeMulti(rot)
+                if ok and decoded_info:
+                    for d in decoded_info:
+                        sn = clean_and_validate_sn(d)
+                        if sn:
+                            return sn
+                else:
+                    data, _, _ = detector.detectAndDecode(rot)
+                    if data:
+                        sn = clean_and_validate_sn(data)
+                        if sn:
+                            return sn
             except Exception:
                 pass
 
@@ -322,8 +373,9 @@ def decode_qr_robust(cv_img):
                 if HAS_PYZBAR:
                     from pyzbar.pyzbar import ZBarSymbol
                     for obj in pyzbar_decode(thresh, symbols=[ZBarSymbol.QRCODE, ZBarSymbol.CODE128]):
-                        sn = obj.data.decode('utf-8', errors='ignore').strip()
-                        if sn and len(sn) >= 6:
+                        raw = obj.data.decode('utf-8', errors='ignore').strip()
+                        sn = clean_and_validate_sn(raw)
+                        if sn:
                             return sn
             except Exception:
                 pass
@@ -361,6 +413,1451 @@ def extract_sn_from_photo(image_path: str) -> str:
         print(f"[EXTRACT SN ERROR]: {e}")
     return ""
 
+
+EASYOCR_READER = None
+
+def get_easyocr_reader():
+    global EASYOCR_READER
+    if EASYOCR_READER is None:
+        try:
+            import easyocr
+            EASYOCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
+        except Exception as e:
+            print(f"[EASYOCR INIT]: {e}")
+            EASYOCR_READER = False
+    return EASYOCR_READER if EASYOCR_READER is not False else None
+
+
+def normalize_v01_candidate(raw: str) -> str:
+    """
+    Normalizes candidate serial numbers from OCR, fixing common OCR letter/digit confusions
+    such as VO1 -> V01, U01 -> V01, N01 -> V01.
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip().upper()
+    # Match patterns like V01..., VO1..., U01..., N01... followed by 7-20 alphanumeric characters
+    m = re.search(r'\b([NUVO][O0]1[0-9A-Z]{7,20})\b', s)
+    if m:
+        candidate = m.group(1)
+        val = 'V01' + candidate[3:]
+        return val
+    return ""
+
+
+def extract_sn_with_ocr(image_path: str) -> str:
+    """
+    2-Way robust SN extraction:
+    1. First tries PyZbar and OpenCV multi-scale QR/Barcode detection.
+    2. Fallback to EasyOCR text recognition looking for 'V01...' patterns.
+    """
+    if not image_path or not os.path.exists(image_path):
+        return ""
+
+    # 1. Barcode / QR detection
+    sn = extract_sn_from_photo(image_path)
+    if sn:
+        return sn
+
+    # 2. EasyOCR text detection
+    reader = get_easyocr_reader()
+    if reader:
+        try:
+            results = reader.readtext(image_path, detail=0)
+            for text in results:
+                norm_sn = normalize_v01_candidate(text)
+                if norm_sn:
+                    print(f"[OCR V01 SN DETECTED]: '{text}' -> '{norm_sn}'")
+                    return norm_sn
+                sn_val = clean_and_validate_sn(text)
+                if sn_val:
+                    return sn_val
+        except Exception as ocr_err:
+            print(f"[OCR SN EXTRACT ERROR]: {ocr_err}")
+
+    return ""
+
+
+def parse_mes_datetime(dt_str: str):
+    """
+    Parses datetime string from MES report into Python datetime object.
+    Supports formats: YYYY-MM-DD HH:MM:SS, YYYY/MM/DD HH:MM:SS, Chinese dates, etc.
+    """
+    if not dt_str or str(dt_str).strip() in ("", "-", "None", "Unknown"):
+        return None
+    s = str(dt_str).strip()
+    s = s.replace("年", "-").replace("月", "-").replace("日", " ")
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+        "%m/%d/%Y %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y"
+    ):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def extract_layup_time_from_content(raw_content: str) -> str:
+    """
+    Extracts the Layup Operating Time (e.g. '2026-08-14 02:00:00' or '2026-09-07 01:22:06')
+    from MES FineReport Electronic Transfer Order HTML table markup or copied plain text.
+    """
+    if not raw_content:
+        return ""
+
+    text_content = re.sub(r'<[^>]+>', ' ', raw_content)
+    text_content = re.sub(r'\s+', ' ', text_content)
+
+    time_pattern = r'(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}(?:[日\s]+\d{1,2}:\d{2}(?::\d{2})?)?)'
+
+    # Priority 1: In HTML table row containing 'Lay up' or 'TUMLAYUP' or '敷设'
+    row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', raw_content, re.IGNORECASE | re.DOTALL)
+    for row in row_matches:
+        if re.search(r'(?:Lay\s*up|TUMLAYUP|敷设)', row, re.IGNORECASE):
+            m_tm = re.search(time_pattern, row)
+            if m_tm:
+                return m_tm.group(1).strip()
+
+    # Priority 2: In plain text near 'Lay up' or '敷设' (within 150 chars)
+    m_lay = re.search(r'(?:Lay\s*up|敷设)[^A-Za-z0-9]{0,30}[^\d]{0,80}' + time_pattern, text_content, re.IGNORECASE)
+    if m_lay:
+        return m_lay.group(1).strip()
+
+    # Priority 3: Within 150 chars before or after TUMLAYUP
+    m_near_before = re.search(time_pattern + r'.{0,150}?TUMLAYUP', text_content, re.IGNORECASE)
+    if m_near_before:
+        return m_near_before.group(1).strip()
+
+    m_near_after = re.search(r'TUMLAYUP.{0,150}?' + time_pattern, text_content, re.IGNORECASE)
+    if m_near_after:
+        return m_near_after.group(1).strip()
+
+    # Priority 4: Operating Time near Lay up
+    m_op = re.search(r'Operating\s*Time\s*' + time_pattern, text_content, re.IGNORECASE)
+    if m_op:
+        return m_op.group(1).strip()
+
+    # Priority 5: Fallback to any process timestamp in the content (Sorting, Welding, Lamination)
+    # Since all processes for this module occurred on the same production day
+    m_any = re.search(r'\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)\b', text_content)
+    if m_any:
+        return m_any.group(1).strip()
+
+    return ""
+
+
+def safe_ascii_url(url: str) -> str:
+    """Ensures any URL is 100% pure ASCII for urllib/http.client by quoting non-ASCII characters."""
+    if not url:
+        return ""
+    try:
+        url.encode('ascii')
+        return url
+    except UnicodeEncodeError:
+        parsed = urllib.parse.urlsplit(url)
+        path = urllib.parse.quote(parsed.path, safe='/:@%')
+        query = urllib.parse.quote(parsed.query, safe='=&%')
+        fragment = urllib.parse.quote(parsed.fragment, safe='=&%')
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, query, fragment))
+
+
+def parse_fr_artifacts(chunk: str) -> dict:
+    """
+    Extracts FineReport runtime artifacts from HTML, JS, or JSON chunks:
+    - sessionID: active FineReport session ID (from sid, currentSessionID, sessionID)
+    - cpt / frm: template path (e.g. production/module_flow.cpt)
+    - iframe_src: embedded report viewer iframe source URL
+    - param_widgets: input parameter names (e.g. MOUDLEID)
+    """
+    results = {}
+    if not chunk:
+        return results
+
+    # 1. sessionID (matches currentSessionID, sessionID, sessionId, var sid)
+    m_sess = re.search(r'(?:currentSessionID|sessionID|sessionId|sid)["\'\s:=]+([0-9a-zA-Z_-]{8,64})', chunk)
+    if not m_sess:
+        m_sess = re.search(r'[?&]sessionID=([0-9a-zA-Z_-]{8,64})', chunk)
+    if m_sess:
+        results['session_id'] = m_sess.group(1)
+
+    # 2. cpt / frm template
+    m_cpt = re.search(r'(?:viewlet|reportlet|templatePath|path)["\'\s:=]+([^"\'\s]+\.(?:cpt|frm))["\'&?]', chunk, re.IGNORECASE)
+    if not m_cpt:
+        m_cpt = re.search(r'["\'=]([a-zA-Z0-9_\-/%\\.]+\.(?:cpt|frm))["\'&?]', chunk, re.IGNORECASE)
+    if m_cpt:
+        results['cpt'] = urllib.parse.unquote(m_cpt.group(1))
+
+    # 3. iframe src
+    m_iframe = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', chunk, re.IGNORECASE)
+    if m_iframe:
+        results['iframe_src'] = m_iframe.group(1)
+
+    # 4. parameter widget names (e.g. MOUDLEID)
+    widgets = re.findall(r'"widgetName"\s*:\s*"([A-Za-z0-9_]+)"', chunk)
+    param_widgets = [w for w in widgets if w.upper() not in ('PARA', 'SEARCH', 'LABELMOUDLEID', 'TOOLBAR', 'PAGESETUP', 'PRINTPREVIEW', 'NEWPRINT', 'EXPORT', 'EMAIL')]
+    if param_widgets:
+        results['param_widgets'] = param_widgets
+
+    return results
+
+
+def read_and_decode_mes_response(raw_bytes: bytes, tag: str = "") -> str:
+    """
+    Decodes raw HTTP response bytes from FineReport into searchable text:
+    - If binary XLSX (PK\x03\x04): parses all sheets and cells using openpyxl
+    - If legacy XLS (\xd0\xcf\x11\xe0...): parses readable strings
+    - Otherwise: decodes UTF-8 HTML / JSON / Text
+    """
+    if not raw_bytes:
+        return ""
+
+    # 1. XLSX Archive
+    if len(raw_bytes) > 200 and raw_bytes[:4] == b'PK\x03\x04':
+        try:
+            import io
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+            excel_rows = []
+            for sname in wb.sheetnames:
+                ws = wb[sname]
+                for row in ws.iter_rows(values_only=True):
+                    r_txt = " ".join(str(c) for c in row if c is not None)
+                    if r_txt.strip():
+                        excel_rows.append(r_txt)
+            excel_text = "\n".join(excel_rows)
+            print(f"[MES EXCEL PARSED {tag}]: {len(wb.sheetnames)} sheets, {len(excel_rows)} rows, {len(excel_text)} bytes")
+            return excel_text
+        except Exception as xl_err:
+            print(f"[MES EXCEL PARSE ERROR {tag}]: {xl_err}")
+
+    # 2. Legacy XLS Stream
+    if len(raw_bytes) > 500 and raw_bytes[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        try:
+            xls_strings = re.findall(rb'[\x20-\x7e]{3,}', raw_bytes)
+            xls_text = " ".join(s.decode('ascii', errors='ignore') for s in xls_strings)
+            print(f"[MES LEGACY XLS PARSED {tag}]: {len(xls_text)} bytes")
+            return xls_text
+        except Exception:
+            pass
+
+    # 3. Standard Text / HTML / JSON
+    return raw_bytes.decode('utf-8', errors='ignore')
+
+
+def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
+    """
+    Queries the Factory MES Reporting Platform (10.200.3.109:8080) for the specified module SN.
+    Searches for machine records:
+      - TUMSOLDERING (Welding / 焊接)
+      - TUMLAYUP (Lay up / 敷设) & Layup Operating Time
+      - TUMLAMINATION (Lamination / 层压)
+    """
+    clean_sn = clean_and_validate_sn(sn) or (normalize_v01_candidate(sn) if sn else "") or (sn.strip().upper() if sn else "")
+    if not clean_sn:
+        return {
+            "status": "error",
+            "sn": "",
+            "message": "Module Serial Number cannot be empty and must be valid",
+            "tumsoldering": "",
+            "tumlayup": "",
+            "tumlamination": "",
+            "layup_time": ""
+        }
+
+    base_url = "http://10.200.3.109:8080"
+    login_url = f"{base_url}/webroot/decision/login"
+    enc_sn = urllib.parse.quote(clean_sn)
+    enc_zh = urllib.parse.quote('组件序列号')
+    report_url = safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&{enc_zh}={enc_sn}")
+    direct_report_url = safe_ascii_url(f"{base_url}/webroot/decision#/?activeTab=416090fb-b706-40e8-9e4d-d698a059f6bf&{enc_zh}={enc_sn}")
+
+    # 1. Check if 10.200.3.109 is reachable from this machine
+    reachable = False
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2.5)
+            s.connect(("10.200.3.109", 8080))
+            reachable = True
+    except Exception:
+        reachable = False
+
+    if not reachable:
+        # Host PC is offline from factory LAN (running on office Wi-Fi)
+        if record_to_trend and clean_sn:
+            save_mes_trend_entry({
+                "sn": clean_sn,
+                "tumsoldering": "",
+                "tumlayup": "",
+                "tumlamination": "",
+                "layup_time": "",
+                "defect": "Offline PC (Auto-Synced via Mobile)",
+                "result": "Pending MES"
+            })
+        return {
+            "status": "offline_pc",
+            "sn": clean_sn,
+            "tumsoldering": "",
+            "tumlayup": "",
+            "tumlamination": "",
+            "layup_time": "",
+            "direct_report_url": direct_report_url,
+            "message": "Host PC is offline from factory LAN (10.200.3.109:8080 unreachable). Auto-extraction engaged on mobile."
+        }
+
+    # 2. Host PC is connected to factory LAN: perform automated login & query
+    try:
+        import http.cookiejar
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+        auth_headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*"
+        }
+
+        # Step A: Automated Login with username 030888, password 030888 (validity: -2 for 14-day session)
+        access_token = ""
+        login_success = False
+        login_endpoints = [
+            f"{base_url}/webroot/decision/login",
+            f"{base_url}/webroot/decision/login/valid",
+            f"{base_url}/webroot/decision/login/v10"
+        ]
+        login_payload = json.dumps({"username": "030888", "password": "030888", "validity": -2}).encode('utf-8')
+
+        for ep in login_endpoints:
+            try:
+                req = urllib.request.Request(ep, data=login_payload, headers=auth_headers)
+                with opener.open(req, timeout=3.5) as resp:
+                    resp_body = resp.read().decode('utf-8', errors='ignore')
+                    try:
+                        resp_json = json.loads(resp_body)
+                        if isinstance(resp_json, dict):
+                            data_obj = resp_json.get('data') or {}
+                            access_token = data_obj.get('accessToken') or resp_json.get('accessToken', '')
+                            login_success = True
+                            print(f"[MES LOGIN]: Success at {ep} (token: {bool(access_token)})")
+                            break
+                    except Exception:
+                        if getattr(resp, 'status', 200) in (200, 204):
+                            login_success = True
+                            print(f"[MES LOGIN]: Success at {ep}")
+                            break
+            except Exception as ep_err:
+                print(f"[MES LOGIN PROBE {ep}]: {ep_err}")
+
+        # Cross-Domain SSO Endpoint Probe
+        try:
+            cross_url = safe_ascii_url(f"{base_url}/webroot/decision/login/cross/domain?fine_username=030888&fine_password=030888&validity=-2")
+            cross_req = urllib.request.Request(cross_url, headers={"User-Agent": auth_headers["User-Agent"]})
+            with opener.open(cross_req, timeout=3.0) as cr_resp:
+                pass
+        except Exception:
+            pass
+
+        # Fallback to form URL encoded if JSON login didn't return success
+        if not login_success:
+            try:
+                form_payload = urllib.parse.urlencode({"username": "030888", "password": "030888"}).encode('utf-8')
+                form_headers = dict(auth_headers)
+                form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                form_req = urllib.request.Request(login_url, data=form_payload, headers=form_headers)
+                with opener.open(form_req, timeout=3.0) as f_resp:
+                    pass
+            except Exception as form_err:
+                print(f"[MES LOGIN FORM]: {form_err}")
+
+        # Step B: Query report with the clean SN
+        cookie_parts = []
+        if access_token:
+            cookie_parts.append(f"fine_auth_token={access_token}")
+        for c in cj:
+            cookie_parts.append(f"{c.name}={c.value}")
+
+        query_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8"
+        }
+        if access_token:
+            query_headers["fine_auth_token"] = access_token
+            query_headers["Authorization"] = f"Bearer {access_token}"
+        if cookie_parts:
+            query_headers["Cookie"] = "; ".join(cookie_parts)
+
+        token_param = f"&fine_auth_token={urllib.parse.quote(access_token)}" if access_token else ""
+        encoded_param_dict = {
+            'MOUDLEID': clean_sn,
+            'moudleid': clean_sn,
+            'MoudleId': clean_sn,
+            'MODULEID': clean_sn,
+            'moduleid': clean_sn,
+            'ModuleId': clean_sn,
+            '组件序列号': clean_sn,
+            'SN': clean_sn,
+            'sn': clean_sn,
+            'ModuleSerialNo': clean_sn,
+            'SerialNo': clean_sn,
+            'barcode': clean_sn,
+            'Barcode': clean_sn,
+            '条码': clean_sn,
+            '组件条码': clean_sn,
+            '序列号': clean_sn,
+            '__bypassevent__': 'true',
+            '_bypassevent_': 'true',
+            'cmd': 'query'
+        }
+        param_string = urllib.parse.urlencode(encoded_param_dict)
+
+        # Probe Directory Entry for 416090fb-b706-40e8-9e4d-d698a059f6bf to find exact template path and session
+        template_path = ""
+        entry_endpoints = [
+            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true",
+            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true",
+            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true&MOUDLEID={clean_sn}&__bypassevent__=true",
+            f"{base_url}/webroot/decision/v10/directory/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/link/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/url/report/view?id=416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/url/mobile/view?id=416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/entry/visit/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/directory/entry/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/directory/entry/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/entry/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/directory/node/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/directory/entry?id=416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/v10/tabs/416090fb-b706-40e8-9e4d-d698a059f6bf"
+        ]
+
+        combined_html = ""
+        known_sessions = set()
+        known_templates = set()
+
+        for ep in entry_endpoints:
+            try:
+                ep_url = safe_ascii_url(f"{ep}?{token_param.lstrip('&')}" if ('?' not in ep and token_param) else (f"{ep}{token_param}" if token_param else ep))
+                req = urllib.request.Request(ep_url, headers=query_headers)
+                with opener.open(req, timeout=3.5) as resp:
+                    raw_body = resp.read()
+                    body = read_and_decode_mes_response(raw_body, tag="ENTRY")
+                    status_code = getattr(resp, 'status', 200)
+                    final_url = resp.geturl()
+                    print(f"[MES ENTRY PROBE]: {ep[:75]}... -> status={status_code}, bytes={len(body)}")
+                    if body:
+                        combined_html += " " + body
+
+                    # Check for session ID or CPT in body or redirected URL
+                    entry_arts = parse_fr_artifacts(body)
+                    url_arts = parse_fr_artifacts(final_url)
+                    e_sess = entry_arts.get('session_id') or url_arts.get('session_id')
+                    e_cpt = entry_arts.get('cpt') or url_arts.get('cpt')
+                    if e_sess:
+                        print(f"[MES ENTRY SESSION FOUND]: SessionID='{e_sess}' from {ep[:60]}")
+                        known_sessions.add(e_sess)
+                    if e_cpt and not template_path:
+                        template_path = e_cpt
+                        print(f"[MES ENTRY CPT FOUND]: '{template_path}'")
+
+                    m_cpt = re.search(r'["\'=]([a-zA-Z0-9_\-/%\\.]+\.(?:cpt|frm))["\'&?]', body, re.IGNORECASE)
+                    if m_cpt and not template_path:
+                        template_path = urllib.parse.unquote(m_cpt.group(1))
+                        print(f"[MES ENTRY REGEX RESOLVED]: 416090fb... -> '{template_path}'")
+
+                    try:
+                        data = json.loads(body)
+                        entry_obj = data.get('data') or data
+                        if isinstance(entry_obj, dict) and not template_path:
+                            template_path = entry_obj.get('path') or entry_obj.get('templatePath') or entry_obj.get('url') or entry_obj.get('reportlet') or entry_obj.get('viewlet') or ""
+                            if template_path:
+                                print(f"[MES ENTRY RESOLVED]: 416090fb... -> '{template_path}'")
+                    except Exception:
+                        pass
+            except Exception as ep_err:
+                print(f"[MES ENTRY ERR {ep[:50]}]: {ep_err}")
+
+        report_urls = [
+            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?op=export&format=html&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?op=export&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/link/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/url/report/view?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&op=export&format=html&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true&{param_string}{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&op=export&format=html&{param_string}{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&{param_string}{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/form?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&op=view&{param_string}{token_param}")
+        ]
+
+        if template_path:
+            enc_tpl = urllib.parse.quote(template_path)
+            report_urls.insert(0, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"))
+            report_urls.insert(1, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&op=export&format=html&{param_string}{token_param}"))
+            report_urls.insert(2, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&{param_string}{token_param}"))
+            report_urls.insert(3, safe_ascii_url(f"{base_url}/webroot/decision/view/form?viewlet={enc_tpl}&{param_string}{token_param}"))
+            report_urls.insert(4, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&op=page_content&pn=1&{param_string}{token_param}"))
+
+        if template_path:
+            known_templates.add(template_path)
+
+        for rep_u in report_urls:
+            try:
+                safe_rep_u = safe_ascii_url(rep_u)
+                r_req = urllib.request.Request(safe_rep_u, headers=query_headers)
+                with opener.open(r_req, timeout=3.5) as r_resp:
+                    raw_bytes = r_resp.read()
+                    chunk = read_and_decode_mes_response(raw_bytes, tag=safe_rep_u[:45])
+                    status_code = getattr(r_resp, 'status', 200)
+                    print(f"[MES FETCH]: {safe_rep_u[:95]}... -> status={status_code}, bytes={len(chunk)}")
+                    combined_html += " " + chunk
+
+                    # Parse runtime artifacts from response and final redirected URL
+                    artifacts = parse_fr_artifacts(chunk)
+                    url_arts = parse_fr_artifacts(r_resp.geturl())
+                    sess_id = artifacts.get('session_id') or url_arts.get('session_id')
+                    cpt = artifacts.get('cpt') or url_arts.get('cpt')
+                    iframe_src = artifacts.get('iframe_src')
+
+                    if sess_id or cpt or iframe_src:
+                        print(f"[MES DISCOVERY]: SessionID='{sess_id}', CPT='{cpt}', IFrame='{iframe_src}'")
+
+                    # Handle embedded iframe
+                    if iframe_src:
+                        try:
+                            if_full = urllib.parse.urljoin(base_url, iframe_src)
+                            sep = '&' if '?' in if_full else '?'
+                            if '__bypassevent__' not in if_full:
+                                if_full = f"{if_full}{sep}MOUDLEID={urllib.parse.quote(clean_sn)}&__bypassevent__=true&{param_string}{token_param}"
+                            else:
+                                if_full = f"{if_full}{sep}MOUDLEID={urllib.parse.quote(clean_sn)}&{param_string}{token_param}"
+                            safe_if = safe_ascii_url(if_full)
+                            with opener.open(urllib.request.Request(safe_if, headers=query_headers), timeout=3.0) as if_resp:
+                                if_raw = if_resp.read()
+                                if_chunk = read_and_decode_mes_response(if_raw, tag="IFRAME")
+                                if if_chunk:
+                                    combined_html += " " + if_chunk
+                                    print(f"[MES FETCH IFRAME]: {len(if_chunk)} bytes")
+                                    sub_arts = parse_fr_artifacts(if_chunk)
+                                    if sub_arts.get('session_id'):
+                                        sess_id = sub_arts['session_id']
+                                    if sub_arts.get('cpt'):
+                                        cpt = sub_arts['cpt']
+                        except Exception as if_err:
+                            print(f"[MES IFRAME ERROR]: {if_err}")
+
+                    # Handle newly discovered CPT template
+                    if cpt and cpt not in known_templates:
+                        known_templates.add(cpt)
+                        enc_cpt = urllib.parse.quote(cpt)
+                        cpt_endpoints = [
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_cpt}&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_cpt}&MOUDLEID={clean_sn}&op=export&format=html&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_cpt}&MOUDLEID={clean_sn}&__bypassevent__=true&{param_string}{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/form?viewlet={enc_cpt}&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}")
+                        ]
+                        for c_u in cpt_endpoints:
+                            try:
+                                with opener.open(urllib.request.Request(c_u, headers=query_headers), timeout=3.0) as c_resp:
+                                    c_raw = c_resp.read()
+                                    c_chunk = read_and_decode_mes_response(c_raw, tag=f"CPT_{cpt[:20]}")
+                                    if c_chunk:
+                                        combined_html += " " + c_chunk
+                                        print(f"[MES FETCH CPT {cpt}]: bytes={len(c_chunk)}")
+                            except Exception:
+                                pass
+
+                    # Handle sessionID
+                    target_sessions = list(known_sessions)
+                    if sess_id and sess_id not in known_sessions:
+                        target_sessions.append(sess_id)
+
+                    for active_sid in target_sessions:
+                        if active_sid in known_sessions and not sess_id:
+                            continue
+                        known_sessions.add(active_sid)
+                        print(f"[MES ACTIVE SESSION]: ID='{active_sid}'")
+
+                        # 1. Trigger parameter submission into active session with MOUDLEID
+                        param_post_urls = [
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_dialog&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision?op=fr_dialog&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=widget&widgetname=moudleid&sessionID={active_sid}&value={clean_sn}{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=widget&widgetname=Search&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_sheet&sessionID={active_sid}&pn=1&MOUDLEID={clean_sn}{token_param}")
+                        ]
+                        for p_u in param_post_urls:
+                            try:
+                                p_req = urllib.request.Request(p_u, data=param_string.encode('utf-8'), headers=query_headers, method='POST')
+                                with opener.open(p_req, timeout=2.5) as p_resp:
+                                    p_raw = p_resp.read()
+                                    p_chunk = read_and_decode_mes_response(p_raw, tag="PARAM_POST")
+                                    if p_chunk:
+                                        combined_html += " " + p_chunk
+                                        print(f"[MES POST SESSION PARAM]: status={getattr(p_resp, 'status', 200)}, bytes={len(p_chunk)}")
+                            except Exception:
+                                pass
+
+                        # 2. Fetch rendered content for Sheet 0 (Chinese) and Sheet 1 (English) + Excel & HTML export
+                        sess_content_endpoints = [
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=0&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=1&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=0&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=1&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=html&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision?op=export&sessionID={active_sid}&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision?op=export&sessionID={active_sid}&format=html&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=html{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=page_content&sessionID={active_sid}&pn=1&__bypassevent__=true{token_param}"),
+                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_sheet&sessionID={active_sid}&pn=1&__bypassevent__=true{token_param}")
+                        ]
+                        for s_u in sess_content_endpoints:
+                            try:
+                                with opener.open(urllib.request.Request(s_u, headers=query_headers), timeout=3.5) as s_resp:
+                                    s_raw = s_resp.read()
+                                    s_chunk = read_and_decode_mes_response(s_raw, tag=s_u[:40])
+                                    if s_chunk:
+                                        combined_html += " " + s_chunk
+                                        print(f"[MES FETCH CONTENT]: url={s_u[:65]}... -> bytes={len(s_chunk)}")
+                                        if clean_sn in s_chunk:
+                                            print(f"[MES FETCH SN HIT]: Found {clean_sn} in session content!")
+                            except Exception as c_err:
+                                print(f"[MES FETCH CONTENT ERR]: {c_err}")
+
+                    # If chunk contains data, break early
+                    if clean_sn in chunk and any(kw in chunk for kw in ("焊接", "敷设", "层压", "TUM", "SOL", "LAY", "LAM", "Stringer", "Lam")):
+                        print(f"[MES FETCH HIT]: Found module data in {safe_rep_u[:70]}...")
+                        break
+            except Exception as rep_err:
+                print(f"[MES FETCH PROBE ERROR]: {rep_err}")
+
+        # Save response for floor diagnostics
+        try:
+            dbg_path = os.path.join(config.LOCAL_DATA_DIR, "last_mes_response.html")
+            with open(dbg_path, "w", encoding="utf-8", errors="ignore") as dbg_f:
+                dbg_f.write(combined_html)
+        except Exception:
+            pass
+
+        # Extract machines, process data, and layup operating time using bilingual extractor
+        parsed_data = extract_info_from_mes_html(combined_html, fallback_sn=clean_sn)
+        soldering = parsed_data.get('tumsoldering', '')
+        layup = parsed_data.get('tumlayup', '')
+        lamination = parsed_data.get('tumlamination', '')
+        layup_time = parsed_data.get('layup_time', '')
+        prod_family = parsed_data.get('product_family', '')
+        lot_no = parsed_data.get('lot_no', '')
+        mo_no = parsed_data.get('mo_no', '')
+        grade = parsed_data.get('appearance_grade', '')
+
+        found_any = bool(soldering or layup or lamination or layup_time)
+        print(f"[MES QUERY PARSED]: SN='{clean_sn}' -> Soldering='{soldering}', Layup='{layup}', Lamination='{lamination}', LayupTime='{layup_time}', Family='{prod_family}', Lot='{lot_no}' (found={found_any})")
+
+        # Record entry if requested so desktop MESProcessLogTab is populated on MES queries
+        if record_to_trend and clean_sn:
+            save_mes_trend_entry({
+                "sn": clean_sn,
+                "tumsoldering": soldering,
+                "tumlayup": layup,
+                "tumlamination": lamination,
+                "layup_time": layup_time,
+                "product_family": prod_family,
+                "lot_no": lot_no,
+                "mo_no": mo_no,
+                "appearance_grade": grade,
+                "defect": "MES Query: Found" if found_any else "MES Query: Blank (Tap Report on Phone)",
+                "result": "Logged" if found_any else "Pending MES"
+            })
+
+        return {
+            "status": "ok",
+            "sn": clean_sn,
+            "tumsoldering": soldering,
+            "tumlayup": layup,
+            "tumlamination": lamination,
+            "layup_time": layup_time,
+            "product_family": prod_family,
+            "lot_no": lot_no,
+            "mo_no": mo_no,
+            "appearance_grade": grade,
+            "raw_found": found_any
+        }
+    except Exception as err:
+        print(f"[MES QUERY ERROR]: {err}")
+        return {
+            "status": "error",
+            "sn": clean_sn,
+            "tumsoldering": "",
+            "tumlayup": "",
+            "tumlamination": "",
+            "layup_time": "",
+            "message": f"Query error: {err}"
+        }
+
+
+# ================== MES BILINGUAL DICTIONARY & TRANSLATOR ==================
+MES_CHINESE_DICTIONARY = [
+    # 1. Header & Order Metadata
+    {
+        "cn": "组件生产流转",
+        "en": "Module Production Routing",
+        "cat": "Header / Document Title",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Page 1/2 report title (Chinese version of Electronic Transfer Order / Process Logsheet)"
+    },
+    {
+        "cn": "组件序列号",
+        "en": "Module Serial Number (SN)",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Unique barcode identifier for solar module, typically starts with V01"
+    },
+    {
+        "cn": "工单号",
+        "en": "MO Number (Work Order)",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Manufacturing Order number (e.g. 5M269M1003)"
+    },
+    {
+        "cn": "产品系列",
+        "en": "Product Family / Series",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Module model series (e.g. TSM-***NEG19RC.20)"
+    },
+    {
+        "cn": "料号",
+        "en": "Part Number / Lot Number",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Component BOM / part identifier (e.g. 6A024170)"
+    },
+    {
+        "cn": "组件规格",
+        "en": "Module Specification / Cell Type",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Cell format or specification code (e.g. 210R, 182R)"
+    },
+    {
+        "cn": "组件外观等级",
+        "en": "Appearance Grade",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Visual cosmetic inspection quality tier (e.g. Q3, A, B, OK, NG)"
+    },
+    {
+        "cn": "组件最终等级",
+        "en": "Final Grade",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Final combined quality rating after EL, IV, and visual tests (e.g. Q3, OK)"
+    },
+    {
+        "cn": "当前工序",
+        "en": "Current Station / Process Step",
+        "cat": "Header Metadata",
+        "equipment": "-",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Active manufacturing stage (e.g. M12, M12工序NG自动Hold)"
+    },
+
+    # 2. Front-End Process Steps (Left Column on Page 1/2)
+    {
+        "cn": "划片",
+        "en": "Laser Scribing / Cell Cutting",
+        "cat": "Front-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Laser cutting of solar cells into half-cut or third-cut pieces"
+    },
+    {
+        "cn": "焊接",
+        "en": "Welding / Soldering / Stringing",
+        "cat": "Front-End Process",
+        "equipment": "TUMSOLDERING / TUMSOLERING",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Stringer machines soldering cells with ribbons (e.g. TUMSOLERING1009)"
+    },
+    {
+        "cn": "叠焊",
+        "en": "Matrix / Auto Bussing",
+        "cat": "Front-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Interconnecting cell strings with bus ribbons into an electrical matrix"
+    },
+    {
+        "cn": "敷设",
+        "en": "Lay up / Module Assembly",
+        "cat": "Front-End Process",
+        "equipment": "TUMLAYUP",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Layering glass, encapsulant (EVA/POE), cell matrix, and backsheet (e.g. TUMLAYUP1004)"
+    },
+    {
+        "cn": "前EL",
+        "en": "Pre-EL Inspection",
+        "cat": "Front-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Electroluminescence optical check before lamination to catch microcracks"
+    },
+    {
+        "cn": "层压",
+        "en": "Lamination",
+        "cat": "Front-End Process",
+        "equipment": "TUMLAMINATION",
+        "page": "Page 1/2 & 2/2",
+        "desc": "Thermal vacuum bonding of module sandwich (e.g. TUMLAMINATION1018 上层3号位)"
+    },
+    {
+        "cn": "削边",
+        "en": "Edge Trimming",
+        "cat": "Front-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Automated trimming of excess EVA/POE after lamination"
+    },
+    {
+        "cn": "终检",
+        "en": "Post-Lam Visual QA",
+        "cat": "Front-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Inspection for bubbles, debris, ribbon shift after lamination"
+    },
+
+    # 3. Back-End Process Steps (Right Column on Page 1/2)
+    {
+        "cn": "固化检验",
+        "en": "Curing Inspection",
+        "cat": "Back-End Process",
+        "equipment": "M901_TUMCV",
+        "page": "Page 1/2",
+        "desc": "Inspection of silicone curing tunnel (e.g. M901_TUMCV1010-S OK)"
+    },
+    {
+        "cn": "装框",
+        "en": "Framing",
+        "cat": "Back-End Process",
+        "equipment": "TUMFRAMING",
+        "page": "Page 1/2",
+        "desc": "Mounting aluminum frames and corner keys (e.g. TUMFRAMING1006)"
+    },
+    {
+        "cn": "接线盒安装",
+        "en": "Junction Box Installation",
+        "cat": "Back-End Process",
+        "equipment": "TUMJBOX",
+        "page": "Page 1/2",
+        "desc": "Affixing junction box base to backsheet (e.g. TUMJBOX1006_1 OK)"
+    },
+    {
+        "cn": "接线盒打胶",
+        "en": "J-Box Potting / Glue Injection",
+        "cat": "Back-End Process",
+        "equipment": "TUMJBOX",
+        "page": "Page 1/2",
+        "desc": "Filling junction box cavity with potting silicone (e.g. TUMJBOX1006_2 OK)"
+    },
+    {
+        "cn": "扣盖/清洗",
+        "en": "Cap Fastening & Cleaning",
+        "cat": "Back-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Snapping J-box cover and automated glass surface washing"
+    },
+    {
+        "cn": "耐压",
+        "en": "Hi-Pot Withstand Voltage Test",
+        "cat": "Electrical QA",
+        "equipment": "MV01_NY / DLSK",
+        "page": "Page 1/2",
+        "desc": "High-voltage electrical insulation and safety test (e.g. DLSK06 合格/Pass)"
+    },
+    {
+        "cn": "功率测试",
+        "en": "Power / Flash Test (IV Curve)",
+        "cat": "Electrical QA",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Sun simulator IV curve rating: Pmax (Watts), Voc, Isc, Fill Factor (FF)"
+    },
+    {
+        "cn": "EL测试",
+        "en": "Final EL Test",
+        "cat": "Electrical QA",
+        "equipment": "TUMEL",
+        "page": "Page 1/2",
+        "desc": "Final electroluminescence crack/defect imaging & grade assignment (e.g. TUMEL1006 Q3)"
+    },
+    {
+        "cn": "分档包装",
+        "en": "Sorting & Bin Packaging",
+        "cat": "Back-End Process",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Automated pallet binning and shipping carton packaging"
+    },
+    {
+        "cn": "评审人员/时间",
+        "en": "Reviewer / Review Timestamp",
+        "cat": "Quality Review",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "QA Inspector name and timestamp of final review (e.g. 马春蕾 2026-09-07)"
+    },
+    {
+        "cn": "评审人员",
+        "en": "Reviewer / QA Inspector",
+        "cat": "Quality Review",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Quality inspector who reviewed and signed off on module"
+    },
+
+    # 4. Status, Chambers & UI Actions
+    {
+        "cn": "合格",
+        "en": "Pass / Qualified / OK",
+        "cat": "Status / Verdict",
+        "equipment": "-",
+        "page": "All Pages",
+        "desc": "Result passed inspection standard"
+    },
+    {
+        "cn": "不合格",
+        "en": "Defective / Failed / NG",
+        "cat": "Status / Verdict",
+        "equipment": "-",
+        "page": "All Pages",
+        "desc": "Result failed quality tolerance"
+    },
+    {
+        "cn": "自动Hold",
+        "en": "Auto-Hold (Line Quarantine)",
+        "cat": "Status / Verdict",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "System automatically quarantined module due to inspection NG"
+    },
+    {
+        "cn": "工序NG自动Hold",
+        "en": "Process NG Auto-Hold",
+        "cat": "Status / Verdict",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Module placed on hold because the specified station flagged an NG"
+    },
+    {
+        "cn": "上层3号位",
+        "en": "Upper Deck Position 3",
+        "cat": "Equipment Chamber",
+        "equipment": "TUMLAMINATION",
+        "page": "Page 1/2",
+        "desc": "Chamber location inside two-tier multi-chamber laminator"
+    },
+    {
+        "cn": "下层4号位",
+        "en": "Lower Deck Position 4",
+        "cat": "Equipment Chamber",
+        "equipment": "TUMLAMINATION",
+        "page": "Page 1/2",
+        "desc": "Lower deck chamber location 4 inside two-tier multi-chamber laminator (Lam12.1 / etc.)"
+    },
+    {
+        "cn": "上层",
+        "en": "Upper Deck / Top Chamber",
+        "cat": "Equipment Chamber",
+        "equipment": "TUMLAMINATION",
+        "page": "Page 1/2",
+        "desc": "Upper heating vacuum chamber"
+    },
+    {
+        "cn": "下层",
+        "en": "Lower Deck / Bottom Chamber",
+        "cat": "Equipment Chamber",
+        "equipment": "TUMLAMINATION",
+        "page": "Page 1/2",
+        "desc": "Lower heating vacuum chamber"
+    },
+    {
+        "cn": "号位",
+        "en": "Position / Slot Number",
+        "cat": "Equipment Chamber",
+        "equipment": "-",
+        "page": "Page 1/2",
+        "desc": "Chamber slot or position index"
+    },
+    {
+        "cn": "确定",
+        "en": "OK / Confirm",
+        "cat": "UI Action",
+        "equipment": "-",
+        "page": "FineReport Web",
+        "desc": "Confirmation button on FineReport popup dialogs"
+    },
+    {
+        "cn": "查询",
+        "en": "Query / Search",
+        "cat": "UI Action",
+        "equipment": "-",
+        "page": "FineReport Web",
+        "desc": "Submit button on FineReport parameter query bar"
+    }
+]
+
+def translate_mes_text(text: str) -> str:
+    """Translates Chinese MES terms into clear English equivalents."""
+    if not text or not isinstance(text, str):
+        return ""
+    res = text
+    # Sort terms by length descending so longer phrases match first
+    sorted_terms = sorted(MES_CHINESE_DICTIONARY, key=lambda x: len(x['cn']), reverse=True)
+    for item in sorted_terms:
+        cn = item['cn']
+        en = item['en']
+        if cn in res:
+            res = res.replace(cn, en)
+    return res
+
+MES_TREND_FILE = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend_log.json")
+
+
+def normalize_soldering_machine(raw_val: str) -> str:
+    """
+    Normalizes soldering machine numbers to stringer line designations:
+    - TUMSOLDERING1001 to TUMSOLDERING1042 -> Stringer101 to Stringer706
+      (6 stringers per line, 7 lines total: line 1 = 1-6, line 2 = 7-12, ..., line 7 = 37-42)
+    - TUMSOLDERING1099 -> TUMSOLDERING1099 (remains unchanged)
+    - Stringer101..706 -> Stringer101..706
+    """
+    if not raw_val:
+        return ""
+    val_str = str(raw_val).strip()
+    if not val_str or val_str in ("-", "None"):
+        return ""
+
+    m_already = re.match(r'^Stringer\s*([1-7]0[1-6])$', val_str, re.IGNORECASE)
+    if m_already:
+        return f"Stringer{m_already.group(1)}"
+
+    m = re.search(r'TUM\s*SOLD?E?RING[\s_-]*(\d+)', val_str, re.IGNORECASE)
+    if m:
+        num = int(m.group(1))
+        n = num - 1000 if num >= 1000 else num
+        if n == 99 or num == 1099:
+            return "TUMSOLDERING1099"
+        if 1 <= n <= 42:
+            line = (n - 1) // 6 + 1
+            st = (n - 1) % 6 + 1
+            return f"Stringer{line}{st:02d}"
+        return val_str.upper()
+
+    return val_str
+
+
+def normalize_lamination_machine(raw_val: str, full_context: str = "") -> str:
+    """
+    Normalizes lamination machine numbers to Lam deck designations:
+    - TUMLAMINATION1001 to TUMLAMINATION1021:
+      - Lower deck (下层 / Lower Deck) -> Lam<X>.1 (e.g. Lam12.1)
+      - Upper deck (上层 / Upper Deck) -> Lam<X>.2 (e.g. Lam12.2)
+      - Unspecified deck -> Lam<X>
+      - Attaches chamber slot position if present, e.g. Lam12.1 (下层4号位) or Lam18.2 (上层3号位)
+    - TUMLAMINATION1099 -> TUMLAMINATION1099 (remains unchanged)
+    - TUMLAYUP -> remains unchanged (handled separately)
+    """
+    if not raw_val and not full_context:
+        return ""
+    val_str = str(raw_val or "").strip()
+    if val_str in ("-", "None"):
+        val_str = ""
+
+    # If already fully formatted as Lam..., keep it
+    if val_str and re.match(r'^Lam\d+(\.\d)?(\s*\(.*\))?$', val_str, re.IGNORECASE):
+        return val_str
+
+    scope = f"{val_str} "
+    if full_context:
+        # Prioritize area around TUMLAMINATION, 层压, or Lamination
+        m_near = re.search(r'(?:TUM\s*LAMINATION|层压|Lamination).{0,120}?(上层\s*\d+\s*号位|下层\s*\d+\s*号位|Upper\s*Deck\s*(?:Pos(?:ition)?\s*)?\d+|Lower\s*Deck\s*(?:Pos(?:ition)?\s*)?\d+|上层|下层|Upper\s*Deck|Lower\s*Deck)', full_context, re.IGNORECASE)
+        if m_near:
+            scope += m_near.group(0) + " "
+        else:
+            scope += full_context
+
+    m_pos = re.search(r'((?:上层|下层)\s*\d+\s*号位|Upper\s*Deck\s*(?:Pos(?:ition)?\s*)?\d+|Lower\s*Deck\s*(?:Pos(?:ition)?\s*)?\d+)', scope, re.IGNORECASE)
+    pos_str = m_pos.group(1).strip() if m_pos else ""
+
+    is_lower = bool(re.search(r'(下层|Lower\s*Deck|\bLower\b)', scope, re.IGNORECASE))
+    is_upper = bool(re.search(r'(上层|Upper\s*Deck|\bUpper\b)', scope, re.IGNORECASE))
+
+    m_mach = re.search(r'TUM\s*LAMINATION[\s_-]*(\d+)', val_str, re.IGNORECASE) or re.search(r'TUM\s*LAMINATION[\s_-]*(\d+)', scope, re.IGNORECASE)
+    if not m_mach:
+        return val_str
+
+    num = int(m_mach.group(1))
+    n = num - 1000 if num >= 1000 else num
+
+    if n == 99 or num == 1099:
+        res = "TUMLAMINATION1099"
+        if pos_str and pos_str not in res:
+            res += f" ({pos_str})"
+        return res
+
+    if 1 <= n <= 21:
+        deck_suffix = ""
+        if is_lower:
+            deck_suffix = ".1"
+        elif is_upper:
+            deck_suffix = ".2"
+        elif re.search(r'Lam\d+\.1', val_str):
+            deck_suffix = ".1"
+        elif re.search(r'Lam\d+\.2', val_str):
+            deck_suffix = ".2"
+
+        base_lam = f"Lam{n}{deck_suffix}"
+        if pos_str:
+            return f"{base_lam} ({pos_str})"
+        return base_lam
+
+    return val_str
+
+
+def extract_info_from_mes_html(raw_content: str, fallback_sn: str = "") -> dict:
+    """
+    Extracts machine and process information from raw HTML markup, copied page text,
+    JSON/JS variables, or OCR-scanned text from FineReport '组件生产流转' (Page 1/2) or
+    'Module Product Process Logsheet' (Page 2/2).
+    """
+    if not raw_content and not fallback_sn:
+        return {}
+
+    # 1. HTML unescape
+    if raw_content:
+        raw_content = html.unescape(raw_content)
+        # 2. Decode \uXXXX unicode escapes (common in FineReport JSON/JS)
+        try:
+            raw_content = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), raw_content)
+        except Exception:
+            pass
+
+    text_content = re.sub(r'<[^>]+>', ' ', raw_content or '')
+    text_content = re.sub(r'\s+', ' ', text_content)
+
+    # 1. Serial Number (V01...)
+    sn = ""
+    m_sn = re.search(r'\b(V01[0-9A-Za-z]{7,20})\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(V01[0-9A-Za-z]{7,20})\b', text_content, re.IGNORECASE)
+    if m_sn:
+        sn = m_sn.group(1).upper()
+    else:
+        norm_sn = normalize_v01_candidate(text_content)
+        if norm_sn:
+            sn = norm_sn
+        elif fallback_sn:
+            sn = clean_and_validate_sn(fallback_sn) or normalize_v01_candidate(fallback_sn) or fallback_sn.strip().upper()
+
+    # 2. Soldering Machine (TUMSOLDERING1001-1042 -> Stringer101-706, 1099 remains TUMSOLDERING1099)
+    soldering = ""
+    m_sol = re.search(r'\b(TUM\s*SOLD?E?RING[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(TUM\s*SOLD?E?RING[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE)
+    if m_sol:
+        soldering = normalize_soldering_machine(m_sol.group(1))
+    else:
+        m_str = re.search(r'\b(Stringer\s*[1-7]0[1-6])\b', text_content, re.IGNORECASE) or re.search(r'\b(Stringer\s*[1-7]0[1-6])\b', raw_content or '', re.IGNORECASE)
+        if m_str:
+            soldering = normalize_soldering_machine(m_str.group(1))
+
+    # 3. Layup Machine (TUMLAYUP... remains unchanged)
+    layup = ""
+    m_lay = re.search(r'\b(TUM\s*LAYUP[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(TUM\s*LAYUP[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE)
+    if m_lay:
+        layup = re.sub(r'\s+', '', m_lay.group(1)).upper()
+
+    # 4. Lamination Machine (TUMLAMINATION1001-1021 -> Lam1.1-21.2 & Deck Position, 1099 remains)
+    lamination = ""
+    m_lam = re.search(r'\b(TUM\s*LAMINATION[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(TUM\s*LAMINATION[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE)
+    if m_lam:
+        lamination = normalize_lamination_machine(m_lam.group(1), full_context=text_content)
+    else:
+        lam_norm = normalize_lamination_machine("", full_context=text_content)
+        if lam_norm:
+            lamination = lam_norm
+
+    # 5. Additional Process Fields (Bilingual: English & Chinese, robust against HTML/JSON delimiters)
+    prod_family = ""
+    m_fam = re.search(r'(TSM-[0-9A-Za-z\.\*\-]+)', text_content, re.IGNORECASE)
+    if m_fam:
+        prod_family = m_fam.group(1).upper()
+    else:
+        m_fam_lbl = re.search(r'(?:Product\s*Family|产品系列|产品型号)[:\s"\'=]+([A-Za-z0-9\.\*\-_]+)', text_content, re.IGNORECASE)
+        if m_fam_lbl:
+            prod_family = m_fam_lbl.group(1).upper()
+
+    lot_no = ""
+    m_lot = re.search(r'(?:Lot\s*No|Lot\s*Number|料号|批次号?|批号)[:\s"\'=]+([0-9A-Za-z]{6,14})', text_content, re.IGNORECASE)
+    if m_lot:
+        lot_no = m_lot.group(1).upper()
+
+    mo_no = ""
+    m_mo = re.search(r'(?:MO\s*No|MO\s*Number|工单号?|制令单号?)[:\s"\'=]+([0-9A-Za-z]{6,16})', text_content, re.IGNORECASE)
+    if m_mo:
+        mo_no = m_mo.group(1).upper()
+
+    grade = ""
+    m_grd = re.search(r'(?:Module\s*Appearance\s*Grade|Appearance\s*Grade|Module\s*Final\s*Grade|Final\s*Grade|组件外观等级|外观等级|组件最终等级|终检等级|等级)[:\s"\'=]+(NG|OK|Q3|[A-D])', text_content, re.IGNORECASE)
+    if m_grd:
+        grade = m_grd.group(1).upper()
+
+    # 6. Current Step & Defect Notes (Bilingual Extraction & Auto-Translation)
+    current_step = ""
+    m_step = re.search(r'(?:Current\s*Step|Current\s*Station|当前工序)[:\s"\'=]+([^\r\n<",]+)', text_content, re.IGNORECASE)
+    if m_step:
+        raw_step = m_step.group(1).strip()
+        raw_step = re.sub(r'\s+(?:划片|焊接|叠焊|敷设|层压|固化检验|装框|接线盒).*$', '', raw_step).strip()
+        trans_step = translate_mes_text(raw_step)
+        current_step = trans_step if trans_step else raw_step
+
+    # 7. Lamination Chamber Position
+    lam_pos = ""
+    m_pos = re.search(r'((?:上层|下层)\s*\d+\s*号位|Upper\s*Deck\s*Pos\s*\d+|Lower\s*Deck\s*Pos\s*\d+)', text_content, re.IGNORECASE)
+    if m_pos:
+        lam_pos = m_pos.group(1).strip()
+    if lamination and lam_pos and "(" not in lamination and lam_pos not in lamination:
+        lamination = f"{lamination} ({lam_pos})"
+
+    # 8. Layup Operating Time
+    layup_time = extract_layup_time_from_content(raw_content or '') or extract_layup_time_from_content(text_content)
+
+    found_any = bool(soldering or layup or lamination or layup_time)
+
+    defect_desc = current_step or ("MES Query: Found" if found_any else "-")
+
+    parsed_result = {
+        "status": "ok" if found_any or sn else "not_found",
+        "sn": sn,
+        "tumsoldering": soldering,
+        "tumlayup": layup,
+        "tumlamination": lamination,
+        "layup_time": layup_time,
+        "product_family": prod_family,
+        "lot_no": lot_no,
+        "mo_no": mo_no,
+        "appearance_grade": grade,
+        "current_step": current_step,
+        "defect": defect_desc,
+        "raw_found": found_any
+    }
+
+    if sn and found_any:
+        save_mes_trend_entry(parsed_result)
+
+    return parsed_result
+
+
+def load_mes_trend_log() -> list:
+    if os.path.exists(MES_TREND_FILE):
+        try:
+            with open(MES_TREND_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for r in data:
+                        if isinstance(r, dict):
+                            s = r.get("tumsoldering")
+                            if s:
+                                r["tumsoldering"] = normalize_soldering_machine(s)
+                            lm = r.get("tumlamination")
+                            if lm:
+                                r["tumlamination"] = normalize_lamination_machine(lm)
+                    return data
+        except Exception:
+            return []
+    return []
+
+
+def save_mes_trend_entry(entry: dict) -> list:
+    logs = load_mes_trend_log()
+    sn = entry.get('sn', '').strip()
+    if not sn or sn in ("Pending SN", "-", "", "None"):
+        return logs
+
+    existing_idx = None
+    for i, r in enumerate(logs):
+        if r.get('sn') == sn:
+            existing_idx = i
+            break
+
+    # Correlate with current defect info from HUD state if not present
+    last_p = LIVE_HUD_STATE.get("last_panel", {})
+    defect_sm = entry.get("defect") or entry.get("current_step") or (last_p.get("summary") if last_p.get("sn") == sn else "") or "-"
+    if defect_sm and any('\u4e00' <= char <= '\u9fff' for char in str(defect_sm)):
+        defect_sm = translate_mes_text(str(defect_sm))
+    defect_res = entry.get("result") or (last_p.get("result") if last_p.get("sn") == sn else "") or "-"
+
+    raw_s = entry.get("tumsoldering", "")
+    norm_s = normalize_soldering_machine(raw_s) if raw_s else ""
+    raw_lm = entry.get("tumlamination", "")
+    norm_lm = normalize_lamination_machine(raw_lm) if raw_lm else ""
+
+    entry_data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sn": sn,
+        "layup_time": entry.get("layup_time", ""),
+        "tumsoldering": norm_s,
+        "tumlayup": entry.get("tumlayup", ""),
+        "tumlamination": norm_lm,
+        "product_family": entry.get("product_family", ""),
+        "lot_no": entry.get("lot_no", ""),
+        "mo_no": entry.get("mo_no", ""),
+        "appearance_grade": entry.get("appearance_grade", ""),
+        "current_step": entry.get("current_step", ""),
+        "defect": defect_sm,
+        "result": defect_res,
+        "photo_path": entry.get("photo_path", "")
+    }
+
+    if existing_idx is not None:
+        for k, v in entry_data.items():
+            if v and v != "-":
+                logs[existing_idx][k] = v
+        final_record = dict(logs[existing_idx])
+    else:
+        logs.insert(0, entry_data)
+        final_record = dict(entry_data)
+
+    logs = logs[:500]
+    try:
+        os.makedirs(os.path.dirname(MES_TREND_FILE), exist_ok=True)
+        with open(MES_TREND_FILE, 'w', encoding='utf-8') as f:
+            json.dump(logs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[MES TREND LOG SAVE ERROR]: {e}")
+
+    global GLOBAL_MES_CALLBACK
+    if GLOBAL_MES_CALLBACK:
+        try:
+            GLOBAL_MES_CALLBACK(final_record)
+        except Exception as cb_err:
+            print(f"[MES DISPATCH ERROR]: {cb_err}")
+
+    return logs
+
+
+def get_mes_layup_time_for_sn(sn: str) -> tuple:
+    """
+    Retrieves the Layup Time (as a datetime object) and Layup Station from MES for a given module SN.
+    1. Looks in local persistent MES log (mes_process_trend_log.json).
+    2. If not found or missing layup_time, queries MES platform directly via query_mes_process_log(sn).
+    Returns (layup_datetime, station_string, mes_record_dict).
+    """
+    clean_sn = clean_and_validate_sn(sn) or (normalize_v01_candidate(sn) if sn else "") or (sn.strip().upper() if sn else "")
+    if not clean_sn:
+        return None, "", {}
+
+    # Check local cache first
+    try:
+        logs = load_mes_trend_log()
+        for r in logs:
+            if r.get('sn') == clean_sn:
+                lt_str = r.get('layup_time') or ""
+                if lt_str:
+                    dt = parse_mes_datetime(lt_str)
+                    if dt:
+                        return dt, r.get('tumlayup', ''), r
+    except Exception as e:
+        print(f"[MES CACHE LOOKUP ERROR]: {e}")
+
+    # Not found in local cache: query MES directly without recording to trend / firing MES tab callback
+    try:
+        res = query_mes_process_log(clean_sn, record_to_trend=False)
+        if isinstance(res, dict) and res.get('status') == 'ok':
+            lt_str = res.get('layup_time') or ""
+            if lt_str:
+                dt = parse_mes_datetime(lt_str)
+                if dt:
+                    return dt, res.get('tumlayup', ''), res
+    except Exception as q_err:
+        print(f"[MES DIRECT QUERY ERROR]: {q_err}")
+
+    return None, "", {}
+
+
+def get_mes_trend_analytics() -> dict:
+    logs = load_mes_trend_log()
+    total = len(logs)
+    sol_counts = {}
+    lay_counts = {}
+    lam_counts = {}
+
+    for r in logs:
+        s = r.get("tumsoldering", "").strip()
+        if s: sol_counts[s] = sol_counts.get(s, 0) + 1
+
+        ly = r.get("tumlayup", "").strip()
+        if ly: lay_counts[ly] = lay_counts.get(ly, 0) + 1
+
+        lm = r.get("tumlamination", "").strip()
+        if lm: lam_counts[lm] = lam_counts.get(lm, 0) + 1
+
+    def to_sorted_list(counts_dict):
+        res = []
+        tot = sum(counts_dict.values())
+        for name, cnt in sorted(counts_dict.items(), key=lambda x: x[1], reverse=True):
+            pct = round((cnt / tot * 100), 1) if tot > 0 else 0
+            res.append({"name": name, "count": cnt, "pct": pct})
+        return res
+
+    return {
+        "total_logged": total,
+        "soldering_top": to_sorted_list(sol_counts),
+        "layup_top": to_sorted_list(lay_counts),
+        "lamination_top": to_sorted_list(lam_counts),
+        "recent_records": logs[:25]
+    }
+
+
+def export_mes_trend_csv_string() -> str:
+    logs = load_mes_trend_log()
+    lines = ["Logged Time,Layup Operating Time,Serial Number,Welding (Stringer),Layup Machine (TUMLAYUP),Lamination Machine (Lam),Product Family,Lot No,Appearance Grade,Defect Summary,Result Grade"]
+    for r in logs:
+        line = [
+            f'"{r.get("timestamp", "")}"',
+            f'"{r.get("layup_time", "")}"',
+            f'"{r.get("sn", "")}"',
+            f'"{r.get("tumsoldering", "")}"',
+            f'"{r.get("tumlayup", "")}"',
+            f'"{r.get("tumlamination", "")}"',
+            f'"{r.get("product_family", "")}"',
+            f'"{r.get("lot_no", "")}"',
+            f'"{r.get("appearance_grade", "")}"',
+            f'"{r.get("defect", "")}"',
+            f'"{r.get("result", "")}"'
+        ]
+        lines.append(",".join(line))
+    return "\n".join(lines)
 
 
 def clean_text(text: str) -> str:
@@ -785,6 +2282,7 @@ LIVE_HUD_STATE = {
 
 GLOBAL_OVERRIDE_CALLBACK = None
 GLOBAL_DEFECT_CALLBACK = None
+GLOBAL_MES_CALLBACK = None
 
 def get_local_ip() -> str:
     try:
@@ -796,12 +2294,14 @@ def get_local_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
-def update_live_hud_state(last_rec=None, live_voice=None, all_records=None, override_callback=None, defect_callback=None):
-    global LIVE_HUD_STATE, GLOBAL_OVERRIDE_CALLBACK, GLOBAL_DEFECT_CALLBACK
+def update_live_hud_state(last_rec=None, live_voice=None, all_records=None, override_callback=None, defect_callback=None, mes_callback=None):
+    global LIVE_HUD_STATE, GLOBAL_OVERRIDE_CALLBACK, GLOBAL_DEFECT_CALLBACK, GLOBAL_MES_CALLBACK
     if override_callback is not None:
         GLOBAL_OVERRIDE_CALLBACK = override_callback
     if defect_callback is not None:
         GLOBAL_DEFECT_CALLBACK = defect_callback
+    if mes_callback is not None:
+        GLOBAL_MES_CALLBACK = mes_callback
 
     if last_rec:
         LIVE_HUD_STATE["last_panel"] = {
@@ -875,6 +2375,8 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Mobile Defect Control Panel</title>
+<script src="/js/jsqr.min.js"></script>
+<script src="/js/zxing.min.js"></script>
 <style>
   :root {
     --bg-main: #0b132b;
@@ -956,10 +2458,12 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
     box-sizing: border-box;
     overflow: hidden;
   }
-  #tab-content-dashboard.active {
+  #tab-content-dashboard.active,
+  #tab-content-mes.active {
     display: block;
     overflow-y: auto;
-    height: auto;
+    height: calc(100vh - 74px);
+    -webkit-overflow-scrolling: touch;
   }
 
   /* ================== TAB 1: DEFECT CONTROL PANEL ================== */
@@ -1501,6 +3005,440 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
   }
   .dialog-btn-cancel { background: #475569; color: #fff; }
   .dialog-btn-save { background: #10b981; color: #fff; }
+
+  /* ================== TAB 3: MES PROCESS LOG ================== */
+  .mes-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+  .mes-card-title {
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .mes-input-group {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .mes-sn-input {
+    flex: 1;
+    background: #0f172a;
+    border: 2px solid #38bdf8;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 15px;
+    font-weight: 800;
+    font-family: 'Consolas', monospace;
+    color: #38bdf8;
+    outline: none;
+    box-sizing: border-box;
+  }
+  .mes-sn-btn {
+    background: #334155;
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .mes-sn-btn:active {
+    background: #2563eb;
+    transform: scale(0.97);
+  }
+  .mes-ingest-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .btn-mes-ingest {
+    background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+    border: 1px solid #38bdf8;
+    border-radius: 10px;
+    padding: 10px 8px;
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    text-align: center;
+    transition: all 0.15s;
+  }
+  .btn-mes-ingest:active {
+    transform: scale(0.97);
+    border-color: #60a5fa;
+  }
+  .btn-mes-ingest-icon { font-size: 20px; }
+  .btn-mes-ingest-title { font-size: 12px; font-weight: 800; color: #fff; }
+  .btn-mes-ingest-sub { font-size: 9px; color: var(--text-muted); }
+
+  /* Dictionary & Translation Modal Styles */
+  .dict-pill {
+    background: #1e293b;
+    border: 1px solid #475569;
+    color: #cbd5e1;
+    border-radius: 20px;
+    padding: 4px 9px;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .dict-pill.active {
+    background: #2563eb;
+    border-color: #60a5fa;
+    color: #fff;
+    font-weight: 700;
+  }
+  .dict-card-item {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 8px 10px;
+    transition: border-color 0.15s, background 0.15s;
+    cursor: pointer;
+  }
+  .dict-card-item:hover, .dict-card-item:active {
+    border-color: #38bdf8;
+    background: #24324d;
+  }
+  .dict-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 3px;
+  }
+  .dict-card-cn {
+    font-size: 14px;
+    font-weight: 800;
+    color: #fff;
+  }
+  .dict-card-en {
+    font-size: 12px;
+    font-weight: 700;
+    color: #38bdf8;
+  }
+  .dict-card-desc {
+    font-size: 10px;
+    color: #94a3b8;
+    line-height: 1.35;
+    margin-top: 3px;
+  }
+
+  /* Highlight Cards */
+  .mes-highlight-item {
+    background: #0f172a;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: all 0.2s;
+  }
+  .mes-highlight-item.present {
+    border-color: #10b981;
+    background: rgba(16, 185, 129, 0.08);
+  }
+  .mes-highlight-item.blank {
+    border-color: #64748b;
+    background: rgba(100, 116, 139, 0.05);
+  }
+  .mes-highlight-name {
+    font-size: 13px;
+    font-weight: 800;
+    color: #f8fafc;
+  }
+  .mes-highlight-sub {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+  .mes-badge {
+    padding: 4px 10px;
+    border-radius: 14px;
+    font-size: 11px;
+    font-weight: 800;
+    font-family: 'Consolas', monospace;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+  }
+  .mes-badge-present {
+    background: rgba(16, 185, 129, 0.2);
+    color: #34d399;
+    border: 1px solid #10b981;
+  }
+  .mes-badge-blank {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid #ef4444;
+  }
+  .mes-badge-pending {
+    background: rgba(148, 163, 184, 0.15);
+    color: #94a3b8;
+    border: 1px solid #64748b;
+  }
+
+  /* Quick-Copy Chips */
+  .mes-chip-bar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .mes-chip {
+    background: #1e293b;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 14px;
+    padding: 5px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #cbd5e1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: all 0.15s;
+  }
+  .mes-chip:active {
+    background: #38bdf8;
+    color: #0f172a;
+  }
+
+  /* Action Launchers */
+  .mes-action-btn-primary {
+    width: 100%;
+    background: linear-gradient(135deg, #2563eb, #1d4ed8);
+    border: 1px solid #60a5fa;
+    color: #fff;
+    border-radius: 10px;
+    padding: 12px;
+    font-size: 13px;
+    font-weight: 800;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
+  }
+  .mes-action-btn-primary:active { transform: scale(0.98); }
+  .mes-action-btn-secondary {
+    flex: 1;
+    background: #334155;
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #f8fafc;
+    border-radius: 8px;
+    padding: 9px;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .mes-action-btn-secondary:active { background: #475569; }
+
+  /* Iframe Viewer Container */
+  .mes-iframe-container {
+    margin-top: 10px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    overflow: hidden;
+    background: #0f172a;
+    display: none;
+  }
+  .mes-iframe-header {
+    background: #1e293b;
+    padding: 8px 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border-color);
+  }
+  .mes-iframe-view {
+    width: 100%;
+    height: 520px;
+    border: none;
+    background: #ffffff;
+  }
+
+  /* Guide Notes */
+  .mes-guide-step {
+    font-size: 11px;
+    color: #cbd5e1;
+    line-height: 1.5;
+    margin-bottom: 6px;
+    padding-left: 14px;
+    position: relative;
+  }
+  .mes-guide-step::before {
+    content: "•";
+    position: absolute;
+    left: 4px;
+    color: #38bdf8;
+    font-weight: bold;
+  }
+  .mes-guide-step strong { color: #fff; }
+  .mes-guide-step .blue-tag {
+    background: #2563eb;
+    color: #fff;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 800;
+  }
+
+  /* Paste HTML Modal Overlay & Box */
+  .modal-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(6px);
+    z-index: 9999;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  .modal-overlay.active {
+    display: flex;
+  }
+  .modal-box {
+    background: #0f172a;
+    border: 1px solid #38bdf8;
+    border-radius: 16px;
+    width: 100%;
+    max-width: 480px;
+    padding: 18px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.7);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .modal-title {
+    font-size: 15px;
+    font-weight: 800;
+    color: #38bdf8;
+  }
+  .paste-textarea {
+    width: 100%;
+    height: 140px;
+    background: #1e293b;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: #f8fafc;
+    padding: 10px;
+    font-family: 'Consolas', monospace;
+    font-size: 11px;
+    resize: vertical;
+    outline: none;
+    box-sizing: border-box;
+  }
+  .paste-textarea:focus {
+    border-color: #38bdf8;
+  }
+
+  /* Trend Section Styles */
+  .trend-bar-group {
+    margin-bottom: 12px;
+  }
+  .trend-header-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    margin-bottom: 4px;
+  }
+  .trend-bar-track {
+    height: 20px;
+    background: #1e293b;
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+  }
+  .trend-bar-fill {
+    height: 100%;
+    border-radius: 6px;
+    transition: width 0.4s ease;
+  }
+  .trend-bar-fill.soldering {
+    background: linear-gradient(90deg, #f59e0b, #ef4444);
+  }
+  .trend-bar-fill.layup {
+    background: linear-gradient(90deg, #10b981, #06b6d4);
+  }
+  .trend-bar-fill.lamination {
+    background: linear-gradient(90deg, #8b5cf6, #ec4899);
+  }
+  .trend-bar-label {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    display: flex;
+    justify-content: space-between;
+    pointer-events: none;
+  }
+  .trend-table-container {
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    margin-top: 8px;
+  }
+  .trend-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10px;
+    text-align: left;
+  }
+  .trend-table th {
+    background: #1e293b;
+    padding: 6px 8px;
+    color: #94a3b8;
+    font-weight: 700;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  .trend-table td {
+    padding: 6px 8px;
+    border-top: 1px solid #1e293b;
+    color: #f8fafc;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -1511,7 +3449,7 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
 <div id="https-banner" class="https-banner">
   <div style="display: flex; align-items: center; gap: 6px;">
     <span style="font-size: 14px;">⚡</span>
-    <span>Live Pixel 6a Camera Scanner available:</span>
+    <span>Live Camera Scanner (iPhone, Samsung, Pixel):</span>
   </div>
   <button onclick="switchToHTTPS()" class="btn-https-switch">Switch to HTTPS (:8443)</button>
 </div>
@@ -1528,7 +3466,7 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="scanner-viewport" id="scanner-viewport">
-    <video id="scanner-video" playsinline autoplay muted></video>
+    <video id="scanner-video" playsinline webkit-playsinline autoplay muted></video>
     <canvas id="scanner-canvas" style="display: none;"></canvas>
     
     <div class="scanner-reticle" id="scanner-reticle">
@@ -1556,7 +3494,7 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="scanner-footer">
-    <button class="scanner-fallback-btn primary-fallback" onclick="triggerFileCamera('SN_PHOTO')">📷 Take SN Photo (Native App)</button>
+    <button class="scanner-fallback-btn primary-fallback" onclick="triggerBarcodePhotoOption()">📷 Take SN Photo (Native App)</button>
     <button class="scanner-fallback-btn" onclick="quickPasteSN()">📋 Paste SN</button>
   </div>
 </div>
@@ -1565,29 +3503,29 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
 <div id="barcode-sheet-modal" class="modal-overlay" onclick="closeBarcodeSheetModal(event)">
   <div class="dialog-card" onclick="event.stopPropagation()">
     <div class="dialog-title">🏷️ Barcode & SN Options</div>
-    <div class="dialog-sub">Choose how to ingest the module serial number:</div>
+    <div class="dialog-sub">Universal Scanner for iPhone 15, Samsung & Pixel:</div>
 
     <button class="sheet-btn-option primary-option" onclick="switchToHTTPS()">
       <span style="font-size: 20px;">⚡</span>
       <div>
         <div>Open Live Camera Scanner (with Zoom)</div>
-        <div style="font-size: 10px; opacity: 0.8;">Opens HTTPS :8443 for instant in-page scan with zoom controls</div>
+        <div style="font-size: 10px; opacity: 0.85;">Opens HTTPS :8443 for instant in-page scan. On Safari/Chrome, accept cert prompt once ("Show Details" / "Advanced" &rarr; "Visit Website")</div>
       </div>
     </button>
 
-    <button class="sheet-btn-option" onclick="closeBarcodeSheetModal(); triggerFileCamera('SN_PHOTO');">
+    <button class="sheet-btn-option" onclick="triggerBarcodePhotoOption();">
       <span style="font-size: 20px;">📷</span>
       <div>
         <div>Take Barcode Photo (Native Camera)</div>
-        <div style="font-size: 10px; opacity: 0.8;">Use full Google Pixel optical zoom and scan photo</div>
+        <div style="font-size: 10px; opacity: 0.85;">Works directly on plain HTTP with zero certificate steps on all devices</div>
       </div>
     </button>
 
     <button class="sheet-btn-option" onclick="closeBarcodeSheetModal(); quickPasteSN();">
       <span style="font-size: 20px;">📋</span>
       <div>
-        <div>Paste from Pixel QR Scanner</div>
-        <div style="font-size: 10px; opacity: 0.8;">Extracts copied text from Pixel Quick Tile</div>
+        <div>Paste from QR Scanner / Clipboard</div>
+        <div style="font-size: 10px; opacity: 0.85;">Extracts copied V01 serial number from clipboard</div>
       </div>
     </button>
 
@@ -1595,7 +3533,7 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
       <span style="font-size: 20px;">✏️</span>
       <div>
         <div>Enter SN Manually</div>
-        <div style="font-size: 10px; opacity: 0.8;">Type or edit serial number directly</div>
+        <div style="font-size: 10px; opacity: 0.85;">Type or edit serial number directly</div>
       </div>
     </button>
 
@@ -1633,6 +3571,7 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
   <div class="tab-nav">
     <button class="tab-btn active" id="tab-btn-control" onclick="switchTab('control')">⚡ Defect Control Panel</button>
     <button class="tab-btn" id="tab-btn-dashboard" onclick="switchTab('dashboard')">📊 Live Dashboard</button>
+    <button class="tab-btn" id="tab-btn-mes" onclick="switchTab('mes')">📋 MES Process Log</button>
   </div>
 </div>
 
@@ -1698,8 +3637,8 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
     <button class="btn-action cam-btn-sn" id="btn-snap-sn" onclick="triggerBarcodeScanner()">
       <span class="cam-icon">🏷️</span>
       <div class="cam-info">
-        <div class="cam-title">2. Barcode Scan</div>
-        <div class="cam-sub" id="sn-cam-status">Tap to scan SN</div>
+        <div class="cam-title">2. Review Barcode</div>
+        <div class="cam-sub" id="sn-cam-status">Defect Tab • SN Photos</div>
       </div>
     </button>
   </div>
@@ -1750,13 +3689,331 @@ MOBILE_HUD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ================= TAB 3: MES PROCESS LOG ================= -->
+<div id="tab-content-mes" class="tab-content">
+  <!-- Module SN & 2 Ingest Ways -->
+  <div class="mes-card">
+    <div class="mes-card-title">
+      <span>Module Serial Number (V01)</span>
+      <span id="mes-query-badge" style="color: #38bdf8; font-size: 10px; font-weight: 700;">Ready</span>
+    </div>
+
+    <div class="mes-input-group">
+      <input type="text" id="mes-sn-input" class="mes-sn-input" placeholder="Scan or enter V01..." autocomplete="off" autocorrect="off" autocapitalize="characters" oninput="onMESSNInputChanged()">
+      <button class="mes-sn-btn" onclick="quickPasteMESText()" title="Paste SN from Clipboard">📋 Paste</button>
+      <button class="mes-sn-btn" onclick="triggerQueryMES()" style="background: #2563eb; border-color: #60a5fa;" title="Query MES Logsheet">🔍 Query</button>
+    </div>
+
+    <!-- The 4 Ingest & Helper Ways (Barcode, Photo, Paste HTML, Chinese Guide) -->
+    <div class="mes-ingest-grid">
+      <button class="btn-mes-ingest" onclick="triggerBarcodeScannerForMES()">
+        <span class="btn-mes-ingest-icon">📋</span>
+        <span class="btn-mes-ingest-title">1. MES Barcode</span>
+        <span class="btn-mes-ingest-sub">MES Log Tab • MES Photos</span>
+      </button>
+
+      <button class="btn-mes-ingest" onclick="triggerPhotoForMES()">
+        <span class="btn-mes-ingest-icon">📷</span>
+        <span class="btn-mes-ingest-title">2. Get SN Pic</span>
+        <span class="btn-mes-ingest-sub">Photo (V01 OCR)</span>
+      </button>
+
+      <button class="btn-mes-ingest" onclick="openPasteHTMLModal()">
+        <span class="btn-mes-ingest-icon">📋</span>
+        <span class="btn-mes-ingest-title">3. Paste HTML</span>
+        <span class="btn-mes-ingest-sub">Extract from MES</span>
+      </button>
+
+      <button class="btn-mes-ingest" onclick="openMESTranslationModal()" style="border-color: #60a5fa; background: linear-gradient(135deg, #1e3a8a 0%, #0f172a 100%);">
+        <span class="btn-mes-ingest-icon">🇨🇳</span>
+        <span class="btn-mes-ingest-title">4. Chinese Guide</span>
+        <span class="btn-mes-ingest-sub">Page 1/2 Dictionary</span>
+      </button>
+    </div>
+    <input type="file" id="mes-photo-file-input" accept="image/*" capture="environment" style="display: none;" onchange="onMESPhotoCaptured(event)">
+  </div>
+
+  <!-- Highlights Information (3 Key Machines: Soldering, Layup, Lamination) -->
+  <div class="mes-card">
+    <div class="mes-card-title">
+      <span>Key Machine Highlights</span>
+      <span style="font-size: 9px; color: var(--text-muted);">From Electronic Transfer Order (Page 2/2)</span>
+    </div>
+
+    <!-- 1. Welding (Stringer 101-706) -->
+    <div class="mes-highlight-item" id="mes-card-soldering">
+      <div>
+        <div class="mes-highlight-name">Welding (Stringer)</div>
+        <div class="mes-highlight-sub">Stringer 101–706 (焊接)</div>
+      </div>
+      <div id="mes-val-soldering" class="mes-badge mes-badge-pending">PENDING SN</div>
+    </div>
+
+    <!-- 2. Layup (TUMLAYUP) -->
+    <div class="mes-highlight-item" id="mes-card-layup">
+      <div>
+        <div class="mes-highlight-name">Lay up (TUMLAYUP)</div>
+        <div class="mes-highlight-sub">Lay up (敷设)</div>
+      </div>
+      <div id="mes-val-layup" class="mes-badge mes-badge-pending">PENDING SN</div>
+    </div>
+
+    <!-- 3. Lamination (Lam 1.1-21.2 & Deck) -->
+    <div class="mes-highlight-item" id="mes-card-lamination">
+      <div>
+        <div class="mes-highlight-name">Lamination (Lam)</div>
+        <div class="mes-highlight-sub">Lam 1.1–21.2 & Deck (层压)</div>
+      </div>
+      <div id="mes-val-lamination" class="mes-badge mes-badge-pending">PENDING SN</div>
+    </div>
+
+    <!-- Additional Process Fields (Auto-populated if extracted) -->
+    <div id="mes-extra-details" style="display: none; background: #1e293b; border-radius: 8px; padding: 8px 10px; margin-top: 8px; font-size: 10px; color: #cbd5e1;">
+      <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+        <span><strong>Family:</strong> <span id="mes-extra-family" style="color:#38bdf8;">-</span></span>
+        <span><strong>Lot/料号:</strong> <span id="mes-extra-lot" style="color:#f59e0b;">-</span></span>
+      </div>
+      <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+        <span><strong>MO/工单:</strong> <span id="mes-extra-mo" style="color:#cbd5e1;">-</span></span>
+        <span><strong>Grade/等级:</strong> <span id="mes-extra-grade" style="color:#10b981; font-weight:700;">-</span></span>
+      </div>
+      <div style="display: flex; justify-content: space-between;">
+        <span><strong>Step/工序:</strong> <span id="mes-extra-step" style="color:#f43f5e; font-weight:700;">-</span></span>
+        <span style="font-size: 9px; color: #94a3b8;"><a href="javascript:void(0)" onclick="openMESTranslationModal()" style="color:#38bdf8; text-decoration: none;">📖 Chinese Guide</a></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1-Tap MES Web Direct Launchers & Quick Clipboard Helpers -->
+  <div class="mes-card">
+    <div class="mes-card-title">
+      <span>MES Portal Access & Quick-Copy</span>
+      <span style="color: #34d399; font-size: 10px;">10.200.3.109:8080</span>
+    </div>
+
+    <button class="mes-action-btn-primary" onclick="openMESReportDirect()">
+      <span>🚀 Open MES Report Tab (416090fb...)</span>
+      <span style="font-size: 11px; opacity: 0.85;">(Auto-copies SN)</span>
+    </button>
+
+    <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+      <button class="mes-action-btn-secondary" onclick="openMESLoginDirect()">
+        <span>🔐 Open Login (030888)</span>
+      </button>
+      <button class="mes-action-btn-secondary" onclick="toggleMESIframe()">
+        <span id="mes-iframe-toggle-text">🖥️ In-Page Viewer</span>
+      </button>
+    </div>
+
+    <div class="mes-chip-bar">
+      <span class="mes-chip" onclick="copyToClipboard('030888', 'Username')">👤 User: 030888</span>
+      <span class="mes-chip" onclick="copyToClipboard('030888', 'Password')">🔑 Pass: 030888</span>
+      <span class="mes-chip" onclick="copyCurrentMESSN()">📋 Copy Active SN</span>
+    </div>
+
+    <!-- Quick Chinese Translation Launcher -->
+    <button class="mes-action-btn-secondary" style="border-color: #38bdf8; background: rgba(56, 189, 248, 0.12); color: #38bdf8; font-weight: 700; width: 100%; justify-content: center; gap: 8px; margin-top: 8px;" onclick="openMESTranslationModal()">
+      <span style="font-size: 15px;">🇨🇳 ⇄ 🇺🇸</span>
+      <span>Open Chinese MES Field Dictionary & Live Translator</span>
+    </button>
+  </div>
+
+  <!-- Embedded In-Page MES Iframe (Toggleable) -->
+  <div class="mes-iframe-container" id="mes-iframe-container">
+    <div class="mes-iframe-header">
+      <div style="display: flex; gap: 4px; align-items: center;">
+        <button class="mes-sn-btn" style="padding: 4px 8px; font-size: 10px;" onclick="loadMESIframe('report')">📄 Report</button>
+        <button class="mes-sn-btn" style="padding: 4px 8px; font-size: 10px;" onclick="loadMESIframe('login')">🔐 Login</button>
+      </div>
+      <div style="display: flex; gap: 4px; align-items: center;">
+        <button class="mes-sn-btn" style="padding: 4px 8px; font-size: 10px;" onclick="reloadMESIframe()">🔄 Reload</button>
+        <button class="mes-sn-btn" style="padding: 4px 8px; font-size: 10px; background: #dc2626;" onclick="toggleMESIframe()">✕</button>
+      </div>
+    </div>
+    <iframe id="mes-frame" class="mes-iframe-view" src="about:blank"></iframe>
+  </div>
+
+  <!-- Visual Operator Guide Card -->
+  <div class="mes-card">
+    <div class="mes-card-title">📖 Operator Guide & Field Reference</div>
+    <div class="mes-guide-step">
+      <strong>Login Credentials:</strong> Username <code style="color:#38bdf8;">030888</code> | Password <code style="color:#38bdf8;">030888</code>
+    </div>
+    <div class="mes-guide-step">
+      <strong>Prompts & Popups:</strong> Click <span class="blue-tag">[ 确定 / OK ]</span> to confirm and dismiss session dialogs.
+    </div>
+    <div class="mes-guide-step">
+      <strong>Parameter Search:</strong> Paste SN into <strong>组件序列号:</strong> (or <strong>Module Serial No:</strong>) and tap <strong>[ 查询 / Query ]</strong>.
+    </div>
+    <div class="mes-guide-step">
+      <strong>Chinese (Page 1/2) vs English (Page 2/2):</strong><br>
+      • <code>组件生产流转</code> = Module Production Routing (Page 1/2)<br>
+      • <code>焊接</code> = Welding / Stringing (<code>TUMSOLERING</code> / <code>TUMSOLDERING</code>)<br>
+      • <code>敷设</code> = Lay up / Assembly (<code>TUMLAYUP</code>)<br>
+      • <code>层压</code> = Lamination (<code>TUMLAMINATION</code>)<br>
+      • <code>料号</code> = Lot / Part Number | <code>工单号</code> = MO Number<br>
+      • <code>耐压</code> = Hi-Pot Test | <code>当前工序</code> = Current Station
+    </div>
+    <div style="margin-top: 8px;">
+      <button class="mes-sn-btn" style="width: 100%; padding: 7px; font-size: 11px; background: #1e293b; border-color: #38bdf8; color: #38bdf8;" onclick="openMESTranslationModal()">
+        📖 View Full Chinese ⇄ English Translation Dictionary
+      </button>
+    </div>
+  </div>
+
+  <!-- Machine Trend Analytics Card -->
+  <div class="mes-card" id="mes-trend-card">
+    <div class="mes-card-title">
+      <div style="display: flex; align-items: center; gap: 6px;">
+        <span>📊 Machine Trend Analytics</span>
+        <span id="mes-trend-count" style="font-size: 10px; color: #38bdf8; font-weight: 700;">(0 logged)</span>
+      </div>
+      <div style="display: flex; gap: 4px;">
+        <button class="mes-sn-btn" style="padding: 3px 8px; font-size: 10px;" onclick="fetchMESTrendAnalytics()" title="Refresh Trend Analytics">🔄</button>
+        <button class="mes-sn-btn" style="padding: 3px 8px; font-size: 10px; background: #059669; border-color: #34d399;" onclick="exportMESTrendCSV()" title="Export CSV Report">📥 Export</button>
+      </div>
+    </div>
+
+    <!-- Trend Distribution Bars -->
+    <div style="margin-top: 6px;">
+      <!-- Soldering Machines -->
+      <div class="trend-bar-group">
+        <div class="trend-header-row">
+          <span>🔥 Welding Stringers (Stringer 101–706)</span>
+          <span id="trend-soldering-summary" style="color: #cbd5e1;">-</span>
+        </div>
+        <div id="trend-soldering-bars">
+          <div style="font-size: 10px; color: var(--text-muted); font-style: italic;">No stringer records yet</div>
+        </div>
+      </div>
+
+      <!-- Layup Machines -->
+      <div class="trend-bar-group">
+        <div class="trend-header-row">
+          <span>🧩 Layup Machines (TUMLAYUP)</span>
+          <span id="trend-layup-summary" style="color: #cbd5e1;">-</span>
+        </div>
+        <div id="trend-layup-bars">
+          <div style="font-size: 10px; color: var(--text-muted); font-style: italic;">No layup records yet</div>
+        </div>
+      </div>
+
+      <!-- Lamination Machines -->
+      <div class="trend-bar-group">
+        <div class="trend-header-row">
+          <span>⚡ Lamination Machines (Lam 1.1–21.2)</span>
+          <span id="trend-lamination-summary" style="color: #cbd5e1;">-</span>
+        </div>
+        <div id="trend-lamination-bars">
+          <div style="font-size: 10px; color: var(--text-muted); font-style: italic;">No lamination records yet</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Modules Logged Table -->
+    <div style="margin-top: 10px;">
+      <div style="font-size: 11px; font-weight: 700; color: #94a3b8; margin-bottom: 4px;">Recent Processed Modules:</div>
+      <div class="trend-table-container">
+        <table class="trend-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Serial Number</th>
+              <th>Stringer</th>
+              <th>Layup</th>
+              <th>Lam (Deck)</th>
+            </tr>
+          </thead>
+          <tbody id="trend-recent-tbody">
+            <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No records logged yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Pasting HTML / Text from FineReport -->
+  <div class="modal-overlay" id="html-paste-modal" onclick="if(event.target===this)closePasteHTMLModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div class="modal-title">📋 Extract MES Info from HTML / Text</div>
+        <button class="mes-sn-btn" style="padding: 2px 8px; font-size: 12px; background: #475569;" onclick="closePasteHTMLModal()">✕</button>
+      </div>
+      <div style="font-size: 11px; color: var(--text-muted); line-height: 1.4;">
+        In Chrome on your phone, copy the page content or HTML table from <strong>Electronic Transfer Order (Page 2/2)</strong> or <strong>组件生产流转 (Page 1/2)</strong>, then paste below to auto-extract <strong>TUMSOLDERING</strong>, <strong>TUMLAYUP</strong>, and <strong>TUMLAMINATION</strong>.
+      </div>
+      <textarea id="mes-html-paste-input" class="paste-textarea" placeholder="Paste copied HTML source or table text here..."></textarea>
+      <div style="display: flex; gap: 8px; justify-content: flex-end;">
+        <button class="mes-sn-btn" style="background: #334155;" onclick="pasteClipboardToHTMLInput()">📋 Paste Clipboard</button>
+        <button class="mes-sn-btn" style="background: #2563eb; border-color: #60a5fa;" onclick="submitHTMLForExtraction()">⚡ Extract & Highlight</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Chinese MES Translation & Dictionary -->
+  <div class="modal-overlay" id="mes-translation-modal" onclick="if(event.target===this)closeMESTranslationModal()">
+    <div class="modal-box" style="max-height: 88vh; display: flex; flex-direction: column; overflow: hidden;" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div class="modal-title">🇨🇳 MES Chinese ⇄ English Guide</div>
+        <button class="mes-sn-btn" style="padding: 2px 8px; font-size: 12px; background: #475569;" onclick="closeMESTranslationModal()">✕</button>
+      </div>
+
+      <!-- Live Chinese Translator Box -->
+      <div style="background: #1e293b; border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; border: 1px solid #334155; flex-shrink: 0;">
+        <div style="font-size: 11px; font-weight: 700; color: #38bdf8; margin-bottom: 4px; display: flex; justify-content: space-between;">
+          <span>🌐 Live Chinese Translator</span>
+          <span style="font-size: 9px; color: #94a3b8;">Type or paste text</span>
+        </div>
+        <div style="display: flex; gap: 6px;">
+          <input type="text" id="mes-trans-live-input" class="mes-sn-input" style="font-size: 12px; height: 34px; padding: 6px 10px;" placeholder="Paste Chinese (e.g. M12工序NG自动Hold, 焊接, 上层3号位)..." oninput="onMESTranslateInputChanged()">
+          <button class="mes-sn-btn" style="padding: 6px 10px; font-size: 11px;" onclick="pasteToMESTranslator()">📋 Paste</button>
+        </div>
+        <div id="mes-trans-live-result" style="display: none; margin-top: 6px; padding: 6px 8px; background: #0f172a; border-radius: 6px; border: 1px solid #38bdf8; font-size: 11px; color: #4ade80;">
+          <strong>Translation:</strong> <span id="mes-trans-live-text">-</span>
+        </div>
+      </div>
+
+      <!-- Search Dictionary Filter -->
+      <div style="display: flex; gap: 6px; margin-bottom: 6px; flex-shrink: 0;">
+        <input type="text" id="mes-dict-search-input" class="mes-sn-input" style="font-size: 12px; height: 34px; padding: 6px 10px;" placeholder="🔍 Filter terms (e.g. 焊接, layup, Q3, 耐压)..." oninput="filterMESDictionary()">
+        <button class="mes-sn-btn" style="padding: 6px 10px; font-size: 11px;" onclick="clearMESDictFilter()">Clear</button>
+      </div>
+
+      <!-- Category Filter Pills -->
+      <div style="display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 6px; flex-shrink: 0;">
+        <button class="dict-pill active" onclick="filterMESCategory('all', this)">All</button>
+        <button class="dict-pill" onclick="filterMESCategory('Header', this)">Headers</button>
+        <button class="dict-pill" onclick="filterMESCategory('Front-End', this)">Front-End</button>
+        <button class="dict-pill" onclick="filterMESCategory('Back-End', this)">Back-End</button>
+        <button class="dict-pill" onclick="filterMESCategory('Electrical', this)">Electrical</button>
+        <button class="dict-pill" onclick="filterMESCategory('Status', this)">Status</button>
+      </div>
+
+      <!-- Scrollable List of Dictionary Items -->
+      <div id="mes-dict-list-container" style="flex: 1; overflow-y: auto; padding-right: 4px; display: flex; flex-direction: column; gap: 6px;">
+      </div>
+
+      <div style="margin-top: 6px; font-size: 9px; color: var(--text-muted); text-align: center; flex-shrink: 0;">
+        Page 1/2 is Chinese (组件生产流转) • Page 2/2 is English (Process Logsheet)
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
+const MES_BASE_URL = "http://10.200.3.109:8080";
+const MES_ACCESS_URL = "http://10.200.3.109:8080/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf";
+const MES_REPORT_URL = "http://10.200.3.109:8080/webroot/decision#/?activeTab=416090fb-b706-40e8-9e4d-d698a059f6bf";
+const MES_LOGIN_URL = "http://10.200.3.109:8080/webroot/decision/login";
+
 const DEFECT_TREE = {{DEFECT_TREE_JSON}};
+const MES_CHINESE_DICT = {{MES_CHINESE_DICT_JSON}};
 
 let selectedClass = Object.keys(DEFECT_TREE)[0] || "Cells Defect";
 let selectedSummary = DEFECT_TREE[selectedClass] ? DEFECT_TREE[selectedClass][0] : "";
 let currentPhotoType = 'DEFECT_PHOTO';
 let currentSN = '';
+let currentMESSN = '';
 let currentGrade = '-';
 
 let activeMediaStream = null;
@@ -1782,29 +4039,82 @@ function switchToHTTPS() {
   location.href = `https://${location.hostname}:${targetPort}/`;
 }
 
-// 1. Text Parsing & SN Extraction Helper
+// 1. Text Parsing & SN Extraction Helper (Strict V01 Module SN Validation)
 function extractSNFromText(text) {
   if (!text) return '';
   text = text.trim();
   
-  // 1. Matches "Trina Solar V01268005042145" or "SN: V01268005042145"
-  const mTrina = text.match(/(?:Trina\\s+Solar\\s+|SN:\\s*|S\\/N:\\s*)([A-Z0-9]{8,25})/i);
-  if (mTrina) return mTrina[1];
+  // 1. Primary Rule: Matches V01 + 7-20 alphanumeric characters (e.g. V01269003050237)
+  const mV01 = text.match(/\\b(V01[0-9A-Za-z]{7,20})\\b/i);
+  if (mV01) return mV01[1].toUpperCase();
+
+  // 2. Matches "Trina Solar V01..." or "SN: V01..." or "S/N: V01..."
+  const mTrinaV01 = text.match(/(?:Trina\\s*Solar\\s*|SN:\\s*|S\\/N:\\s*)(V01[0-9A-Za-z]{7,20})/i);
+  if (mTrinaV01) return mTrinaV01[1].toUpperCase();
+
+  // 3. Clean direct check: starts with V01
+  const clean = text.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  if (clean.startsWith('V01') && clean.length >= 10) {
+    return clean;
+  }
   
-  // 2. Solar module SN format starting with V / capital letter and digits (10-25 chars)
-  const mV = text.match(/\\b([A-Z][0-9A-Z]{9,24})\\b/);
-  if (mV) return mV[1];
-  
-  // 3. General 8-25 char alphanumeric code
-  const mGen = text.match(/\\b([A-Z0-9]{8,25})\\b/i);
-  if (mGen) return mGen[1];
-  
-  return text.replace(/\\s+/g, '');
+  // Discard all non-V01 barcodes (such as model barcodes 615NEG19RC...)
+  return '';
 }
 
-// 2. Set Active Serial Number & Sync to Desktop App
+// 2A. Dedicated MES Serial Number Ingest (Isolated from Defect Review)
+function setMESSerialNumber(sn, source = 'MES') {
+  if (!sn) return;
+  const clean = extractSNFromText(sn) || (sn.toUpperCase().startsWith('V01') ? sn.trim().toUpperCase() : '');
+  if (!clean) return;
+  currentMESSN = clean;
+  const mesInput = document.getElementById('mes-sn-input');
+  if (mesInput) mesInput.value = clean;
+  const badge = document.getElementById('mes-query-badge');
+  if (badge) { badge.innerText = 'Auto-Querying MES...'; badge.style.color = '#38bdf8'; }
+
+  // 1. Immediately log to dedicated MES endpoint so desktop MESProcessLogTab gets this SN instantly!
+  try {
+    fetch(`/api/mes_scan_sn?sn=${encodeURIComponent(clean)}&source=${encodeURIComponent(source)}`);
+  } catch (e) {
+    console.warn('MES scan sync notice:', e);
+  }
+
+  // 2. Automated background login & prefetch to FineReport
+  autoLoginFineReportOnPhone(clean);
+
+  // 3. Query MES process log details
+  if (typeof queryMESProcessLog === 'function') {
+    queryMESProcessLog(clean);
+  }
+}
+
+function autoLoginFineReportOnPhone(cleanSN) {
+  // Pre-authenticates phone browser into FineReport with 030888/030888 via cross-domain SSO
+  const ssoUrl = `${MES_BASE_URL}/webroot/decision/login/cross/domain?fine_username=030888&fine_password=030888&validity=-2`;
+  const ssoScript = document.createElement('script');
+  ssoScript.src = ssoUrl;
+  ssoScript.async = true;
+  document.head.appendChild(ssoScript);
+  setTimeout(() => { try { document.head.removeChild(ssoScript); } catch(e){} }, 3000);
+
+  // Pre-load in-page iframe to the exact entry access with SN parameter
+  const frame = document.getElementById('mes-frame');
+  if (frame && cleanSN) {
+    frame.src = `${MES_ACCESS_URL}?preview=true&MOUDLEID=${encodeURIComponent(cleanSN)}&__bypassevent__=true&组件序列号=${encodeURIComponent(cleanSN)}&SN=${encodeURIComponent(cleanSN)}`;
+  }
+}
+
+
+// 2B. Set Active Serial Number for Defect Control & Sync to Desktop App
 async function setSerialNumber(sn, source = 'Manual') {
   if (!sn) return;
+  // STRICT TAB ISOLATION GUARD: Never route MES activity to Defect Review!
+  if (typeof currentMobileTab !== 'undefined' && (currentMobileTab === 'mes' || scannerTarget === 'MES')) {
+    setMESSerialNumber(sn, source);
+    return;
+  }
+
   currentSN = sn;
   const snEl = document.getElementById('disp-sn');
   if (snEl) snEl.innerText = sn;
@@ -1832,8 +4142,13 @@ async function quickPasteSN() {
       if (text) {
         const sn = extractSNFromText(text);
         if (sn && sn.length >= 6) {
-          setSerialNumber(sn, 'Clipboard Paste');
-          showToast(`✅ Pasted SN: ${sn}`);
+          if (currentMobileTab === 'mes' || scannerTarget === 'MES') {
+            setMESSerialNumber(sn, 'Clipboard Paste');
+            showToast(`✅ MES SN: ${sn}`);
+          } else {
+            setSerialNumber(sn, 'Clipboard Paste');
+            showToast(`✅ Pasted SN: ${sn}`);
+          }
           playScanBeep();
           if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
           return;
@@ -1854,11 +4169,18 @@ async function checkClipboardOnFocus() {
     if (!text || text === lastCheckedClipboard) return;
     lastCheckedClipboard = text;
     const sn = extractSNFromText(text);
-    if (sn && sn.length >= 8 && sn !== currentSN) {
-      setSerialNumber(sn, 'Auto-Clipboard');
-      showToast(`📋 Auto-detected SN from QR: ${sn}`);
-      playScanBeep();
-      if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+    if (sn && sn.length >= 8) {
+      if (currentMobileTab === 'mes' || scannerTarget === 'MES') {
+        setMESSerialNumber(sn, 'Auto-Clipboard');
+        showToast(`📋 Auto-detected MES SN: ${sn}`);
+        playScanBeep();
+        if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+      } else if (sn !== currentSN) {
+        setSerialNumber(sn, 'Auto-Clipboard');
+        showToast(`📋 Auto-detected SN from QR: ${sn}`);
+        playScanBeep();
+        if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+      }
     }
   } catch (e) {
     // Ignore background permission restrictions
@@ -1874,7 +4196,12 @@ document.addEventListener('visibilitychange', () => {
 function openSNModal() {
   const modal = document.getElementById('sn-input-modal');
   const input = document.getElementById('manual-sn-input');
-  input.value = currentSN && currentSN !== 'Pending SN' ? currentSN : '';
+  if (typeof currentMobileTab !== 'undefined' && (currentMobileTab === 'mes' || scannerTarget === 'MES')) {
+    const mesInput = document.getElementById('mes-sn-input');
+    input.value = (mesInput && mesInput.value.trim()) || currentMESSN || '';
+  } else {
+    input.value = currentSN && currentSN !== 'Pending SN' ? currentSN : '';
+  }
   modal.classList.add('active');
   setTimeout(() => input.focus(), 150);
 }
@@ -1905,8 +4232,13 @@ function saveSNInput() {
   const val = document.getElementById('manual-sn-input').value.trim();
   if (val) {
     const sn = extractSNFromText(val);
-    setSerialNumber(sn, 'Manual Input');
-    showToast(`✅ Serial Number set: ${sn}`);
+    if (currentMobileTab === 'mes' || scannerTarget === 'MES') {
+      setMESSerialNumber(sn, 'Manual Input');
+      showToast(`✅ MES Serial Number set: ${sn}`);
+    } else {
+      setSerialNumber(sn, 'Manual Input');
+      showToast(`✅ Serial Number set: ${sn}`);
+    }
     playScanBeep();
     if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
   }
@@ -1950,6 +4282,7 @@ function resetActivePanel() {
 }
 
 async function triggerBarcodeScanner() {
+  scannerTarget = 'CONTROL';
   // If in Secure Context (HTTPS or localhost) where live camera streaming is enabled
   if (window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
     try {
@@ -1961,6 +4294,15 @@ async function triggerBarcodeScanner() {
   }
   // If on HTTP or live stream denied, open user-friendly option sheet
   openBarcodeSheetModal();
+}
+
+function triggerBarcodePhotoOption() {
+  closeBarcodeSheetModal();
+  if (scannerTarget === 'MES') {
+    triggerPhotoForMES();
+  } else {
+    triggerFileCamera('SN_PHOTO');
+  }
 }
 
 function triggerDefectCamera() {
@@ -2113,20 +4455,55 @@ async function openLiveScanner() {
 
   modal.classList.add('active');
   reticle.classList.remove('detected');
-  hint.innerText = '⚡ Align QR / Barcode in frame';
+  hint.innerText = (scannerTarget === 'MES' || (typeof currentMobileTab !== 'undefined' && currentMobileTab === 'mes'))
+    ? '📋 Align Barcode for Factory MES Log'
+    : '🏷️ Align Barcode for Module Review';
   isTorchActive = false;
+
+  // iOS Safari requires attributes before attaching stream
+  video.setAttribute('playsinline', 'true');
+  video.setAttribute('webkit-playsinline', 'true');
+  video.muted = true;
 
   const constraints = {
     video: {
       facingMode: { ideal: currentFacingMode },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 }
-    }
+      width: { ideal: 1280, max: 1920 },
+      height: { ideal: 720, max: 1080 }
+    },
+    audio: false
   };
 
-  activeMediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+  try {
+    activeMediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err1) {
+    console.warn('Initial camera constraints failed, trying basic fallback:', err1);
+    try {
+      activeMediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: currentFacingMode },
+        audio: false
+      });
+    } catch (err2) {
+      console.error('All camera access attempts failed:', err2);
+      closeLiveScanner();
+      showToast('❌ Camera stream failed or denied', true);
+      openBarcodeSheetModal();
+      return;
+    }
+  }
+
   video.srcObject = activeMediaStream;
-  await video.play();
+  try {
+    await video.play();
+  } catch (playErr) {
+    console.warn('Waiting for video loadedmetadata to play:', playErr);
+    await new Promise((resolve) => {
+      video.onloadedmetadata = () => {
+        video.play().then(resolve).catch(resolve);
+      };
+      setTimeout(resolve, 800);
+    });
+  }
 
   // Initialize zoom controls & pinch listener
   initZoomCapabilities();
@@ -2168,7 +4545,7 @@ async function toggleTorch() {
       await track.applyConstraints({ advanced: [{ torch: isTorchActive }] });
       document.getElementById('btn-torch').style.background = isTorchActive ? '#f59e0b' : 'rgba(255,255,255,0.15)';
     } else {
-      showToast('Flashlight not supported on this stream');
+      showToast('Flashlight not supported on this browser/stream');
     }
   } catch (e) {
     console.warn('Torch error:', e);
@@ -2196,41 +4573,117 @@ async function startLiveDetectionLoop() {
   const reticle = document.getElementById('scanner-reticle');
   const hint = document.getElementById('scanner-hint');
 
-  // Use Pixel 6a native hardware BarcodeDetector
-  let detector = null;
+  // Tier 1: Hardware BarcodeDetector (Google Pixel 6a / Chromium Android)
+  let nativeDetector = null;
   if ('BarcodeDetector' in window) {
     try {
-      detector = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'code_39', 'data_matrix', 'ean_13', 'upc_a'] });
+      nativeDetector = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'code_39', 'data_matrix', 'ean_13', 'upc_a'] });
     } catch(e) {}
   }
 
-  while (liveScannerRunning) {
-    if (video.readyState >= 2 && detector) {
-      try {
-        const barcodes = await detector.detect(video);
-        if (barcodes && barcodes.length > 0) {
-          const raw = barcodes[0].rawValue.trim();
-          const cleanSN = extractSNFromText(raw);
-          if (cleanSN && cleanSN.length >= 6) {
-            // Instant Lock!
-            liveScannerRunning = false;
-            reticle.classList.add('detected');
-            hint.innerHTML = `<span style="color:#10b981; font-weight:bold;">✅ Found: ${cleanSN}</span>`;
-            
-            playScanBeep();
-            if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+  // Tier 3: ZXing MultiFormat Reader (Code 128 / Code 39 / Data Matrix on iPhone 15 & Samsung)
+  let zxingReader = null;
+  if (window.ZXing && window.ZXing.BrowserMultiFormatReader) {
+    try {
+      zxingReader = new ZXing.BrowserMultiFormatReader();
+    } catch(e) {}
+  }
 
-            // Snap high-res frame and upload directly
-            captureAndUploadLiveFrame(video, cleanSN);
-            
-            setTimeout(() => {
-              closeLiveScanner();
-            }, 350);
-            return;
+  // Shared offscreen canvas for high-performance frame sampling
+  const scanCanvas = document.createElement('canvas');
+
+  while (liveScannerRunning) {
+    if (video.readyState >= 2) {
+      let foundSN = '';
+      let sawWrongBarcode = false;
+      let wrongRaw = '';
+
+      // --- TIER 1: Native BarcodeDetector (<5ms) ---
+      if (nativeDetector) {
+        try {
+          const barcodes = await nativeDetector.detect(video);
+          if (barcodes && barcodes.length > 0) {
+            for (const b of barcodes) {
+              const raw = (b.rawValue || '').trim();
+              const clean = extractSNFromText(raw);
+              if (clean && clean.startsWith('V01')) {
+                foundSN = clean;
+                break;
+              } else if (raw) {
+                sawWrongBarcode = true;
+                wrongRaw = raw.split('|')[0].trim();
+              }
+            }
           }
+        } catch (detErr) {}
+      }
+
+      // --- TIER 2: Fast jsQR Engine (10-25ms) for iPhone 15 Safari & Samsung Internet ---
+      if (!foundSN && window.jsQR) {
+        try {
+          const vw = video.videoWidth || 640;
+          const vh = video.videoHeight || 480;
+          const scale = Math.min(1.0, 720 / Math.max(vw, vh));
+          const sw = Math.round(vw * scale);
+          const sh = Math.round(vh * scale);
+
+          scanCanvas.width = sw;
+          scanCanvas.height = sh;
+          const sctx = scanCanvas.getContext('2d', { willReadFrequently: true });
+          sctx.drawImage(video, 0, 0, sw, sh);
+          const imgData = sctx.getImageData(0, 0, sw, sh);
+          const qr = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "attemptBoth" });
+          if (qr && qr.data) {
+            const raw = qr.data.trim();
+            const clean = extractSNFromText(raw);
+            if (clean && clean.startsWith('V01')) {
+              foundSN = clean;
+            } else if (raw) {
+              sawWrongBarcode = true;
+              wrongRaw = raw.split('|')[0].trim();
+            }
+          }
+        } catch (qrErr) {}
+      }
+
+      // --- TIER 3: ZXing MultiFormat Reader for 1D Barcode & DataMatrix on iPhone 15 & Samsung ---
+      if (!foundSN && zxingReader) {
+        try {
+          const zxResult = zxingReader.decode(video);
+          if (zxResult && zxResult.text) {
+            const raw = zxResult.text.trim();
+            const clean = extractSNFromText(raw);
+            if (clean && clean.startsWith('V01')) {
+              foundSN = clean;
+            } else if (raw) {
+              sawWrongBarcode = true;
+              wrongRaw = raw.split('|')[0].trim();
+            }
+          }
+        } catch (zxErr) {
+          // ZXing throws NotFoundException when frame has no code, expected
         }
-      } catch (detErr) {
-        // continue
+      }
+
+      if (foundSN) {
+        // Instant Lock on V01 SN!
+        liveScannerRunning = false;
+        reticle.classList.add('detected');
+        hint.innerHTML = `<span style="color:#10b981; font-weight:bold;">✅ Found: ${foundSN}</span>`;
+        
+        playScanBeep();
+        if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+
+        // Snap high-res frame and upload directly
+        captureAndUploadLiveFrame(video, foundSN);
+        
+        setTimeout(() => {
+          closeLiveScanner();
+        }, 350);
+        return;
+      } else if (sawWrongBarcode) {
+        // Show real-time guidance warning on screen
+        hint.innerHTML = `<span style="color:#f59e0b; font-weight:bold; font-size:12px;">⚠️ Model Barcode (${wrongRaw.slice(0, 16)})<br>Aim at bottom Barcode (starts with V01)</span>`;
       }
     }
     await new Promise(r => setTimeout(r, 60)); // Fast ~16 FPS detection loop
@@ -2238,8 +4691,17 @@ async function startLiveDetectionLoop() {
 }
 
 async function captureAndUploadLiveFrame(video, detectedSN) {
-  setSerialNumber(detectedSN, 'Live Scanner');
-  showToast(`✅ Scanned SN: ${detectedSN}`);
+  const isMes = (scannerTarget === 'MES' || (typeof currentMobileTab !== 'undefined' && currentMobileTab === 'mes'));
+  if (isMes) {
+    closeLiveScanner();
+    setMESSerialNumber(detectedSN, 'MES Live Scanner');
+    showToast(`✅ Scanned MES SN: ${detectedSN}`);
+    playScanBeep();
+    if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
+  } else {
+    setSerialNumber(detectedSN, 'Live Scanner');
+    showToast(`✅ Scanned SN: ${detectedSN}`);
+  }
 
   const canvas = document.getElementById('scanner-canvas');
   const vw = video.videoWidth || 1280;
@@ -2263,7 +4725,8 @@ async function captureAndUploadLiveFrame(video, detectedSN) {
     try {
       const ts = (Date.now() / 1000).toFixed(3);
       const snParam = `&client_sn=${encodeURIComponent(detectedSN)}`;
-      await fetch(`/api/upload_photo?type=SN_PHOTO&timestamp=${ts}${snParam}`, {
+      const targetParam = isMes ? `&type=MES_PHOTO&target_tab=mes` : `&type=SN_PHOTO&target_tab=control`;
+      await fetch(`/api/upload_photo?timestamp=${ts}${snParam}${targetParam}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: blob
@@ -2279,30 +4742,78 @@ async function onCameraPhotoCaptured(e) {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
 
+  // STRICT TAB ISOLATION GUARD:
+  if (typeof currentMobileTab !== 'undefined' && (currentMobileTab === 'mes' || scannerTarget === 'MES')) {
+    onMESPhotoCaptured(e);
+    return;
+  }
+
   const type = currentPhotoType;
   const statusEl = document.getElementById(type === 'SN_PHOTO' ? 'sn-cam-status' : 'def-cam-status');
   
   if (statusEl) statusEl.innerText = type === 'SN_PHOTO' ? '⏳ Scanning QR...' : '⏳ Uploading...';
   showToast(`Uploading ${type === 'SN_PHOTO' ? 'Barcode' : 'Defect'} photo...`);
 
-  // Instant hardware BarcodeDetector on Google Pixel 6a (<5ms)
+  // Universal on-device barcode recognition (<50ms)
   let clientDetectedSN = '';
-  if (type === 'SN_PHOTO' && 'BarcodeDetector' in window) {
-    try {
-      const detector = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'code_39', 'data_matrix', 'ean_13', 'upc_a'] });
-      const imgBitmap = await createImageBitmap(file);
-      const detected = await detector.detect(imgBitmap);
-      if (detected && detected.length > 0) {
-        const raw = detected[0].rawValue.trim();
-        clientDetectedSN = extractSNFromText(raw);
-        if (clientDetectedSN) {
-          setSerialNumber(clientDetectedSN, 'Photo BarcodeDetector');
-          playScanBeep();
-          if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
+  if (type === 'SN_PHOTO') {
+    // 1. Native BarcodeDetector (Google Pixel 6a / Android Chrome)
+    if ('BarcodeDetector' in window) {
+      try {
+        const detector = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'code_39', 'data_matrix', 'ean_13', 'upc_a'] });
+        const imgBitmap = await createImageBitmap(file);
+        const detected = await detector.detect(imgBitmap);
+        if (detected && detected.length > 0) {
+          for (const d of detected) {
+            const raw = (d.rawValue || '').trim();
+            const clean = extractSNFromText(raw);
+            if (clean && clean.startsWith('V01')) {
+              clientDetectedSN = clean;
+              break;
+            }
+          }
         }
-      }
-    } catch (detErr) {
-      console.warn('BarcodeDetector error:', detErr);
+      } catch (detErr) {}
+    }
+
+    // 2. jsQR Fallback (iPhone 15 & Samsung)
+    if (!clientDetectedSN && window.jsQR) {
+      try {
+        const imgBitmap = await createImageBitmap(file);
+        const canvas = document.createElement('canvas');
+        canvas.width = imgBitmap.width;
+        canvas.height = imgBitmap.height;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(imgBitmap, 0, 0);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const qr = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "attemptBoth" });
+        if (qr && qr.data) {
+          const clean = extractSNFromText(qr.data);
+          if (clean && clean.startsWith('V01')) clientDetectedSN = clean;
+        }
+      } catch (e) {}
+    }
+
+    // 3. ZXing Fallback (iPhone 15 & Samsung for 1D/DataMatrix)
+    if (!clientDetectedSN && window.ZXing && window.ZXing.BrowserMultiFormatReader) {
+      try {
+        const reader = new ZXing.BrowserMultiFormatReader();
+        const img = new Image();
+        img.src = URL.createObjectURL(file);
+        await new Promise((res) => { img.onload = res; img.onerror = res; });
+        const zx = reader.decode(img);
+        if (zx && zx.text) {
+          const clean = extractSNFromText(zx.text);
+          if (clean && clean.startsWith('V01')) clientDetectedSN = clean;
+        }
+        URL.revokeObjectURL(img.src);
+      } catch (e) {}
+    }
+
+    if (clientDetectedSN) {
+      setSerialNumber(clientDetectedSN, 'Photo Client Scanner');
+      playScanBeep();
+      if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
     }
   }
 
@@ -2435,13 +4946,31 @@ function showToast(msg, isError = false) {
   setTimeout(() => t.classList.remove('show'), 2500);
 }
 
+let currentMobileTab = 'control'; // 'control', 'dashboard', 'mes'
+
 function switchTab(tabId) {
+  currentMobileTab = tabId;
+  if (tabId === 'mes') {
+    scannerTarget = 'MES';
+  } else {
+    scannerTarget = 'CONTROL';
+  }
+
   document.getElementById('tab-btn-control').classList.toggle('active', tabId === 'control');
   document.getElementById('tab-btn-dashboard').classList.toggle('active', tabId === 'dashboard');
+  const btnMes = document.getElementById('tab-btn-mes');
+  if (btnMes) btnMes.classList.toggle('active', tabId === 'mes');
+
   document.getElementById('tab-content-control').classList.toggle('active', tabId === 'control');
   document.getElementById('tab-content-dashboard').classList.toggle('active', tabId === 'dashboard');
+  const contentMes = document.getElementById('tab-content-mes');
+  if (contentMes) contentMes.classList.toggle('active', tabId === 'mes');
+
   if (tabId === 'dashboard') {
     fetchDashboardStatus();
+  } else if (tabId === 'mes') {
+    // STRICT TAB ISOLATION: Do not sync MR tab's currentSN into MES tab!
+    fetchMESTrendAnalytics();
   }
 }
 
@@ -2532,11 +5061,653 @@ async function fetchDashboardStatus() {
   }
 }
 
+// ================== TAB 3: MES PROCESS LOG HELPERS ==================
+let scannerTarget = 'CONTROL'; // 'CONTROL' or 'MES'
+
+function triggerBarcodeScannerForMES() {
+  scannerTarget = 'MES';
+  if (location.protocol === 'https:' && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    openLiveScanner();
+  } else {
+    const sheet = document.getElementById('barcode-sheet-modal');
+    if (sheet) sheet.classList.add('active');
+    else triggerPhotoForMES();
+  }
+}
+
+function triggerPhotoForMES() {
+  scannerTarget = 'MES';
+  const inp = document.getElementById('mes-photo-file-input');
+  if (inp) {
+    inp.value = '';
+    inp.click();
+  }
+}
+
+async function onMESPhotoCaptured(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+
+  showToast('🔍 Analyzing picture for V01 SN...');
+  const badge = document.getElementById('mes-query-badge');
+  if (badge) { badge.innerText = 'Extracting SN...'; badge.style.color = '#f59e0b'; }
+
+  let detectedSN = '';
+  // 1. Instant client-side BarcodeDetector (<5ms, Pixel 6a)
+  if ('BarcodeDetector' in window) {
+    try {
+      const detector = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'code_39', 'data_matrix', 'ean_13', 'upc_a'] });
+      const imgBitmap = await createImageBitmap(file);
+      const detected = await detector.detect(imgBitmap);
+      if (detected && detected.length > 0) {
+        for (const d of detected) {
+          const clean = extractSNFromText((d.rawValue || '').trim());
+          if (clean && clean.startsWith('V01')) {
+            detectedSN = clean;
+            break;
+          }
+        }
+      }
+    } catch(err) {}
+  }
+
+  // 2. jsQR Client Fallback (iPhone 15 & Samsung)
+  if (!detectedSN && window.jsQR) {
+    try {
+      const imgBitmap = await createImageBitmap(file);
+      const canvas = document.createElement('canvas');
+      canvas.width = imgBitmap.width;
+      canvas.height = imgBitmap.height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(imgBitmap, 0, 0);
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const qr = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "attemptBoth" });
+      if (qr && qr.data) {
+        const clean = extractSNFromText(qr.data);
+        if (clean && clean.startsWith('V01')) detectedSN = clean;
+      }
+    } catch (e) {}
+  }
+
+  // 3. ZXing Client Fallback (iPhone 15 & Samsung for 1D/DataMatrix)
+  if (!detectedSN && window.ZXing && window.ZXing.BrowserMultiFormatReader) {
+    try {
+      const reader = new ZXing.BrowserMultiFormatReader();
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      await new Promise((res) => { img.onload = res; img.onerror = res; });
+      const zx = reader.decode(img);
+      if (zx && zx.text) {
+        const clean = extractSNFromText(zx.text);
+        if (clean && clean.startsWith('V01')) detectedSN = clean;
+      }
+      URL.revokeObjectURL(img.src);
+    } catch (e) {}
+  }
+
+  // 4. Server-side robust fallback: EasyOCR extracts SN AND Machines AND Layup Time from photos/screenshots
+  try {
+    const res = await fetch('/api/extract_sn_from_image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (!detectedSN && data.sn) detectedSN = data.sn;
+      if (data.tumsoldering || data.tumlayup || data.tumlamination || data.layup_time) {
+        if (badge) { badge.innerText = 'Screen OCR Loaded'; badge.style.color = '#10b981'; }
+        updateHighlightCard('soldering', data.tumsoldering);
+        updateHighlightCard('layup', data.tumlayup, data.layup_time);
+        updateHighlightCard('lamination', data.tumlamination);
+        if (data.layup_time) setTxt('panel-layup', data.layup_time);
+        fetchMESTrendAnalytics();
+        showToast('✅ Machine details extracted from screen photo!');
+      }
+    }
+  } catch(srvErr) {
+    console.warn('Server OCR error:', srvErr);
+  }
+
+  if (detectedSN) {
+    setMESSerialNumber(detectedSN, 'MES Picture');
+    showToast(`✅ Extracted SN: ${detectedSN}`);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(detectedSN).catch(()=>{});
+    }
+  } else {
+    if (badge) { badge.innerText = 'No V01 SN found'; badge.style.color = '#ef4444'; }
+    showToast('⚠️ Could not find V01 SN in picture. Please try closer or enter manually.', true);
+  }
+}
+
+async function queryMESProcessLog(sn) {
+  if (!sn) {
+    const mesInput = document.getElementById('mes-sn-input');
+    sn = mesInput ? mesInput.value.trim() : '';
+  }
+  const cleanSN = extractSNFromText(sn) || (sn.toUpperCase().startsWith('V01') ? sn.trim().toUpperCase() : '');
+  if (!cleanSN) {
+    return;
+  }
+
+  const badge = document.getElementById('mes-query-badge');
+  if (badge) { badge.innerText = 'Auto-Querying MES...'; badge.style.color = '#38bdf8'; }
+
+  setHighlightBadge('soldering', 'Checking...', 'pending');
+  setHighlightBadge('layup', 'Checking...', 'pending');
+  setHighlightBadge('lamination', 'Checking...', 'pending');
+
+  try {
+    const res = await fetch(`/api/mes_query?sn=${encodeURIComponent(cleanSN)}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.status === 'ok' && (data.raw_found || data.tumsoldering || data.tumlayup || data.tumlamination)) {
+        if (badge) { badge.innerText = 'Logsheet Retrieved'; badge.style.color = '#10b981'; }
+        updateHighlightCard('soldering', data.tumsoldering);
+        updateHighlightCard('layup', data.tumlayup, data.layup_time);
+        updateHighlightCard('lamination', data.tumlamination);
+        if (data.layup_time) setTxt('panel-layup', data.layup_time);
+        if (data.product_family || data.lot_no || data.mo_no || data.appearance_grade) {
+          const extraBox = document.getElementById('mes-extra-details');
+          if (extraBox) {
+            extraBox.style.display = 'block';
+            const setSpan = (id, val) => { const el = document.getElementById(id); if (el) el.innerText = val || '-'; };
+            setSpan('mes-extra-family', data.product_family);
+            setSpan('mes-extra-lot', data.lot_no);
+            setSpan('mes-extra-mo', data.mo_no);
+            setSpan('mes-extra-grade', data.appearance_grade);
+          }
+        }
+        fetchMESTrendAnalytics();
+        showToast('✅ Auto-extracted from FineReport!');
+        return;
+      } else if (data.status === 'offline_pc') {
+        // Host PC is offline from factory LAN, attempt direct fetch via phone Wi-Fi
+        if (badge) { badge.innerText = 'Connecting via Phone...'; badge.style.color = '#38bdf8'; }
+        
+        try {
+          const directUrl = `${MES_ACCESS_URL}?preview=true&MOUDLEID=${encodeURIComponent(cleanSN)}&__bypassevent__=true&op=export&format=html&组件序列号=${encodeURIComponent(cleanSN)}&SN=${encodeURIComponent(cleanSN)}`;
+          const dResp = await fetch(directUrl, { mode: 'cors' });
+          if (dResp.ok) {
+            const dHtml = await dResp.text();
+            if (dHtml) {
+              const resExt = await fetch('/api/extract_from_html', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                body: JSON.stringify({ content: dHtml, sn: cleanSN })
+              });
+              if (resExt.ok) {
+                const extData = (await resExt.json()).data || {};
+                if (extData.tumsoldering || extData.tumlayup || extData.tumlamination) {
+                  updateHighlightCard('soldering', extData.tumsoldering);
+                  updateHighlightCard('layup', extData.tumlayup, extData.layup_time);
+                  updateHighlightCard('lamination', extData.tumlamination);
+                  if (extData.layup_time) setTxt('panel-layup', extData.layup_time);
+                  fetchMESTrendAnalytics();
+                  if (badge) { badge.innerText = 'Auto-Extracted via Wi-Fi'; badge.style.color = '#10b981'; }
+                  showToast('✅ Auto-extracted from FineReport via Phone Wi-Fi!');
+                  return;
+                }
+              }
+            }
+          }
+        } catch (phoneErr) {}
+
+        // In-page viewer pre-authenticated fallback
+        const container = document.getElementById('mes-iframe-container');
+        if (container) {
+          container.style.display = 'block';
+          const toggleTxt = document.getElementById('mes-iframe-toggle-text');
+          if (toggleTxt) toggleTxt.innerText = '✕ Hide In-Page Viewer';
+          autoLoginFineReportOnPhone(cleanSN);
+        }
+        if (badge) { badge.innerText = 'In-Page MES Loaded'; badge.style.color = '#10b981'; }
+        setHighlightBadge('soldering', 'Loaded In-Page Viewer', 'pending');
+        setHighlightBadge('layup', 'Loaded In-Page Viewer', 'pending');
+        setHighlightBadge('lamination', 'Loaded In-Page Viewer', 'pending');
+        showToast('🖥️ Auto-loaded in In-Page Viewer below!');
+        return;
+      } else {
+        if (badge) { badge.innerText = data.raw_found ? 'Logsheet Retrieved' : 'No Record for SN'; badge.style.color = data.raw_found ? '#10b981' : '#f59e0b'; }
+        updateHighlightCard('soldering', data.tumsoldering);
+        updateHighlightCard('layup', data.tumlayup, data.layup_time);
+        updateHighlightCard('lamination', data.tumlamination);
+        if (data.layup_time) setTxt('panel-layup', data.layup_time);
+        return;
+      }
+    }
+    if (badge) { badge.innerText = 'Query Ready'; badge.style.color = '#38bdf8'; }
+    setHighlightBadge('soldering', '-', 'blank');
+    setHighlightBadge('layup', '-', 'blank');
+    setHighlightBadge('lamination', '-', 'blank');
+  } catch(e) {
+    if (badge) { badge.innerText = 'Query Error'; badge.style.color = '#ef4444'; }
+    setHighlightBadge('soldering', '-', 'blank');
+    setHighlightBadge('layup', '-', 'blank');
+    setHighlightBadge('lamination', '-', 'blank');
+  }
+}
+
+function updateHighlightCard(key, value, extraText = "") {
+  const card = document.getElementById(`mes-card-${key}`);
+  const valEl = document.getElementById(`mes-val-${key}`);
+  if (!valEl) return;
+
+  if (value && value.trim()) {
+    valEl.innerText = `PRESENT: ${value}`;
+    valEl.className = 'mes-badge mes-badge-present';
+    if (card) { card.classList.add('present'); card.classList.remove('blank'); }
+  } else {
+    valEl.innerText = 'BLANK (No record)';
+    valEl.className = 'mes-badge mes-badge-blank';
+    if (card) { card.classList.add('blank'); card.classList.remove('present'); }
+  }
+}
+
+function setHighlightBadge(key, text, type) {
+  const card = document.getElementById(`mes-card-${key}`);
+  const valEl = document.getElementById(`mes-val-${key}`);
+  if (valEl) {
+    valEl.innerText = text;
+    valEl.className = `mes-badge mes-badge-${type}`;
+  }
+  if (card) {
+    card.classList.remove('present', 'blank');
+  }
+}
+
+function openMESReportDirect() {
+  const mesInput = document.getElementById('mes-sn-input');
+  const sn = (mesInput ? mesInput.value.trim() : '') || currentMESSN || '';
+  autoLoginFineReportOnPhone(sn);
+  if (sn && sn !== 'Pending SN') {
+    copyToClipboard(sn, 'Module SN');
+    showToast(`🚀 Auto-Logging In (030888) & Opening MES Report for ${sn}...`);
+    const directUrl = `${MES_ACCESS_URL}?preview=true&MOUDLEID=${encodeURIComponent(sn)}&__bypassevent__=true&组件序列号=${encodeURIComponent(sn)}&ModuleSerialNo=${encodeURIComponent(sn)}&SN=${encodeURIComponent(sn)}`;
+    window.open(directUrl, '_blank');
+  } else {
+    showToast('🚀 Auto-Logging In (030888) & Opening MES Report...');
+    window.open(`${MES_ACCESS_URL}?preview=true`, '_blank');
+  }
+}
+
+function openMESLoginDirect() {
+  copyToClipboard('030888', 'Login Credential (030888)');
+  showToast('🔐 Copied 030888 to clipboard! Opening login page...');
+  window.open(MES_LOGIN_URL, '_blank');
+}
+
+function copyToClipboard(text, label = 'Text') {
+  if (!text) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      showToast(`📋 Copied ${label}: ${text}`);
+    }).catch(() => {
+      prompt(`Copy ${label}:`, text);
+    });
+  } else {
+    prompt(`Copy ${label}:`, text);
+  }
+}
+
+function copyCurrentMESSN() {
+  const mesInput = document.getElementById('mes-sn-input');
+  const sn = (mesInput ? mesInput.value.trim() : '') || currentMESSN || '';
+  if (sn && sn !== 'Pending SN') {
+    copyToClipboard(sn, 'Module SN');
+  } else {
+    showToast('No SN to copy yet', true);
+  }
+}
+
+async function quickPasteMESText() {
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        const sn = extractSNFromText(text) || text.trim().toUpperCase();
+        if (sn) {
+          showToast(`📋 Pasted: ${sn}`);
+          setMESSerialNumber(sn, 'MES Paste');
+        }
+      }
+    } catch(e) {
+      showToast('Tap to paste directly into input', true);
+    }
+  }
+}
+
+function onMESSNInputChanged() {
+  const mesInput = document.getElementById('mes-sn-input');
+  if (!mesInput) return;
+  const sn = extractSNFromText(mesInput.value) || mesInput.value.trim().toUpperCase();
+  if (sn.startsWith('V01') && sn.length >= 10) {
+    currentMESSN = sn;
+    setMESSerialNumber(sn, 'MES Input');
+  }
+}
+
+function triggerQueryMES() {
+  const mesInput = document.getElementById('mes-sn-input');
+  const sn = mesInput ? mesInput.value.trim() : '';
+  queryMESProcessLog(sn);
+}
+
+function syncCurrentSNToMES() {
+  // Intentionally no-op to maintain complete bi-directional tab isolation between MR and MES
+}
+
+function toggleMESIframe() {
+  const container = document.getElementById('mes-iframe-container');
+  const toggleTxt = document.getElementById('mes-iframe-toggle-text');
+  if (!container) return;
+  const isVisible = (container.style.display === 'block');
+  if (isVisible) {
+    container.style.display = 'none';
+    if (toggleTxt) toggleTxt.innerText = '🖥️ In-Page Viewer';
+  } else {
+    container.style.display = 'block';
+    if (toggleTxt) toggleTxt.innerText = '✕ Hide In-Page Viewer';
+    loadMESIframe('report');
+  }
+}
+
+function loadMESIframe(type) {
+  const frame = document.getElementById('mes-frame');
+  if (!frame) return;
+  if (type === 'login') {
+    frame.src = MES_LOGIN_URL;
+  } else {
+    frame.src = MES_REPORT_URL;
+  }
+}
+
+function reloadMESIframe() {
+  const frame = document.getElementById('mes-frame');
+  if (frame) {
+    frame.src = frame.src;
+  }
+}
+
+// ================== HTML EXTRACTOR & TREND HELPERS ==================
+function openPasteHTMLModal() {
+  const modal = document.getElementById('html-paste-modal');
+  if (modal) {
+    modal.classList.add('active');
+    const ta = document.getElementById('mes-html-paste-input');
+    if (ta) setTimeout(() => ta.focus(), 150);
+  }
+}
+
+function closePasteHTMLModal() {
+  const modal = document.getElementById('html-paste-modal');
+  if (modal) modal.classList.remove('active');
+}
+
+async function pasteClipboardToHTMLInput() {
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    try {
+      const text = await navigator.clipboard.readText();
+      const ta = document.getElementById('mes-html-paste-input');
+      if (ta && text) {
+        ta.value = text;
+        showToast('📋 Pasted text from clipboard');
+        return;
+      }
+    } catch(e) {}
+  }
+  showToast('Please long-press and paste inside the box', true);
+}
+
+async function submitHTMLForExtraction() {
+  const ta = document.getElementById('mes-html-paste-input');
+  const content = ta ? ta.value.trim() : '';
+  if (!content) {
+    showToast('Please paste HTML or table text first', true);
+    return;
+  }
+
+  showToast('⚡ Extracting machines & process data...');
+  const mesInput = document.getElementById('mes-sn-input');
+  const activeSn = (mesInput ? mesInput.value.trim() : '') || currentMESSN || '';
+  try {
+    const res = await fetch('/api/extract_from_html', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ content: content, sn: activeSn })
+    });
+
+    if (res.ok) {
+      const jsonResp = await res.json();
+      const data = jsonResp.data || {};
+      
+      if (data.sn) {
+        const mesInput = document.getElementById('mes-sn-input');
+        if (mesInput) mesInput.value = data.sn;
+      }
+
+      updateHighlightCard('soldering', data.tumsoldering);
+      updateHighlightCard('layup', data.tumlayup, data.layup_time);
+      updateHighlightCard('lamination', data.tumlamination);
+      if (data.layup_time) setTxt('panel-layup', data.layup_time);
+
+      const extraBox = document.getElementById('mes-extra-details');
+      if (extraBox && (data.product_family || data.lot_no || data.mo_no || data.appearance_grade)) {
+        extraBox.style.display = 'block';
+        const setSpan = (id, val) => { const el = document.getElementById(id); if (el) el.innerText = val || '-'; };
+        setSpan('mes-extra-family', data.product_family);
+        setSpan('mes-extra-lot', data.lot_no);
+        setSpan('mes-extra-mo', data.mo_no);
+        setSpan('mes-extra-grade', data.appearance_grade);
+      }
+
+      const badge = document.getElementById('mes-query-badge');
+      if (badge) { badge.innerText = 'HTML Processed'; badge.style.color = '#10b981'; }
+
+      if (jsonResp.trend) {
+        renderMESTrendAnalytics(jsonResp.trend);
+      } else {
+        fetchMESTrendAnalytics();
+      }
+
+      closePasteHTMLModal();
+      showToast('✅ Machine highlights extracted & trend logged');
+    } else {
+      showToast('❌ Extraction request failed', true);
+    }
+  } catch(err) {
+    showToast('❌ Extraction connection error', true);
+  }
+}
+
+async function fetchMESTrendAnalytics() {
+  try {
+    const res = await fetch('/api/mes_trend');
+    if (res.ok) {
+      const data = await res.json();
+      renderMESTrendAnalytics(data);
+    }
+  } catch(e) {
+    console.warn('Failed to fetch MES trend:', e);
+  }
+}
+
+function renderMESTrendAnalytics(data) {
+  if (!data) return;
+  const countEl = document.getElementById('mes-trend-count');
+  if (countEl) countEl.innerText = `(${data.total_logged || 0} logged)`;
+
+  const renderBars = (containerId, summaryId, items, colorClass) => {
+    const container = document.getElementById(containerId);
+    const summary = document.getElementById(summaryId);
+    if (!container) return;
+    if (!items || items.length === 0) {
+      container.innerHTML = '<div style="font-size: 10px; color: var(--text-muted); font-style: italic;">No records yet</div>';
+      if (summary) summary.innerText = '-';
+      return;
+    }
+    if (summary) summary.innerText = `${items.length} machine${items.length > 1 ? 's' : ''}`;
+    container.innerHTML = items.slice(0, 5).map(item => `
+      <div class="trend-bar-track">
+        <div class="trend-bar-fill ${colorClass}" style="width: ${Math.max(item.pct, 8)}%;"></div>
+        <div class="trend-bar-label">
+          <span>${item.name}</span>
+          <span>${item.count} (${item.pct}%)</span>
+        </div>
+      </div>
+    `).join('');
+  };
+
+  renderBars('trend-soldering-bars', 'trend-soldering-summary', data.soldering_top, 'soldering');
+  renderBars('trend-layup-bars', 'trend-layup-summary', data.layup_top, 'layup');
+  renderBars('trend-lamination-bars', 'trend-lamination-summary', data.lamination_top, 'lamination');
+
+  const tbody = document.getElementById('trend-recent-tbody');
+  if (tbody && data.recent_records) {
+    if (data.recent_records.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No records logged yet</td></tr>';
+    } else {
+      tbody.innerHTML = data.recent_records.slice(0, 15).map(r => `
+        <tr>
+          <td style="color: var(--text-muted); font-size: 9px;">${(r.timestamp || '').split(' ')[1] || r.timestamp}</td>
+          <td style="font-weight: 700; color: #38bdf8;">${r.sn || '-'}</td>
+          <td><span style="color: ${r.tumsoldering ? '#f59e0b' : '#64748b'}; font-weight: 600;">${r.tumsoldering || '-'}</span></td>
+          <td><span style="color: ${r.tumlayup ? '#10b981' : '#64748b'}; font-weight: 600;">${r.tumlayup || '-'}</span></td>
+          <td><span style="color: ${r.tumlamination ? '#c084fc' : '#64748b'}; font-weight: 600;">${r.tumlamination || '-'}</span></td>
+        </tr>
+      `).join('');
+    }
+  }
+}
+
+function exportMESTrendCSV() {
+  window.open('/api/export_mes_trend_csv', '_blank');
+}
+
+// ================== MES CHINESE ⇄ ENGLISH DICTIONARY & TRANSLATOR ==================
+let currentDictCategory = 'all';
+
+function openMESTranslationModal() {
+  const modal = document.getElementById('mes-translation-modal');
+  if (modal) {
+    modal.classList.add('active');
+    renderMESDictionaryList();
+    const input = document.getElementById('mes-dict-search-input');
+    if (input) setTimeout(() => input.focus(), 150);
+  }
+}
+
+function closeMESTranslationModal() {
+  const modal = document.getElementById('mes-translation-modal');
+  if (modal) modal.classList.remove('active');
+}
+
+function translateMESTextClient(text) {
+  if (!text || typeof text !== 'string') return '';
+  let res = text;
+  const dict = Array.isArray(MES_CHINESE_DICT) ? MES_CHINESE_DICT : [];
+  const sorted = [...dict].sort((a, b) => (b.cn ? b.cn.length : 0) - (a.cn ? a.cn.length : 0));
+  for (const item of sorted) {
+    if (item.cn && res.includes(item.cn)) {
+      res = res.split(item.cn).join(item.en);
+    }
+  }
+  return res;
+}
+
+function onMESTranslateInputChanged() {
+  const input = document.getElementById('mes-trans-live-input');
+  const resBox = document.getElementById('mes-trans-live-result');
+  const resText = document.getElementById('mes-trans-live-text');
+  if (!input || !resBox || !resText) return;
+  const val = input.value.trim();
+  if (!val) {
+    resBox.style.display = 'none';
+    return;
+  }
+  const translated = translateMESTextClient(val);
+  resText.innerText = translated || val;
+  resBox.style.display = 'block';
+}
+
+async function pasteToMESTranslator() {
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    try {
+      const text = await navigator.clipboard.readText();
+      const input = document.getElementById('mes-trans-live-input');
+      if (input && text) {
+        input.value = text;
+        onMESTranslateInputChanged();
+        showToast('📋 Pasted text for translation');
+        return;
+      }
+    } catch(e) {}
+  }
+  showToast('Please type or long-press paste', true);
+}
+
+function filterMESCategory(cat, el) {
+  currentDictCategory = cat;
+  const pills = document.querySelectorAll('.dict-pill');
+  pills.forEach(p => p.classList.remove('active'));
+  if (el) el.classList.add('active');
+  renderMESDictionaryList();
+}
+
+function filterMESDictionary() {
+  renderMESDictionaryList();
+}
+
+function clearMESDictFilter() {
+  const input = document.getElementById('mes-dict-search-input');
+  if (input) input.value = '';
+  filterMESCategory('all', document.querySelector('.dict-pill'));
+}
+
+function renderMESDictionaryList() {
+  const container = document.getElementById('mes-dict-list-container');
+  if (!container) return;
+  const searchInput = document.getElementById('mes-dict-search-input');
+  const q = (searchInput ? searchInput.value.trim().toLowerCase() : '');
+
+  const dict = Array.isArray(MES_CHINESE_DICT) ? MES_CHINESE_DICT : [];
+  const filtered = dict.filter(item => {
+    if (currentDictCategory !== 'all') {
+      const cat = (item.cat || '').toLowerCase();
+      if (!cat.includes(currentDictCategory.toLowerCase())) return false;
+    }
+    if (q) {
+      const haystack = `${item.cn} ${item.en} ${item.cat} ${item.equipment} ${item.desc}`.toLowerCase();
+      return haystack.includes(q);
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    container.innerHTML = '<div style="font-size: 11px; color: var(--text-muted); text-align: center; padding: 15px;">No matching terms found.</div>';
+    return;
+  }
+
+  container.innerHTML = filtered.map(item => `
+    <div class="dict-card-item" onclick="copyToClipboard('${item.cn} (${item.en})', 'Translation')">
+      <div class="dict-card-header">
+        <span class="dict-card-cn">${item.cn}</span>
+        <span class="pill" style="font-size: 8px; padding: 2px 6px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">${item.cat || 'General'}</span>
+      </div>
+      <div class="dict-card-en">${item.en}</div>
+      ${item.equipment && item.equipment !== '-' ? `<div style="font-size: 10px; color: #fbbf24; margin-top: 2px;"><strong>Equipment:</strong> <code>${item.equipment}</code></div>` : ''}
+      <div class="dict-card-desc">${item.desc || ''}</div>
+    </div>
+  `).join('');
+}
+
 // Init
 renderClasses();
 renderSummaries();
 updateSelectedDisplay();
 setInterval(fetchDashboardStatus, 2000);
+fetchMESTrendAnalytics();
 </script>
 </body>
 </html>
@@ -2545,6 +5716,7 @@ setInterval(fetchDashboardStatus, 2000);
 def render_mobile_hud_html():
     cfg_layout = getattr(config, 'MOBILE_LAYOUT_SETTINGS', {})
     html = MOBILE_HUD_HTML.replace('{{DEFECT_TREE_JSON}}', json.dumps(config.DEFECT_TREE))
+    html = html.replace('{{MES_CHINESE_DICT_JSON}}', json.dumps(MES_CHINESE_DICTIONARY, ensure_ascii=False))
     html = html.replace('{{STATUS_PADDING}}', cfg_layout.get('status_padding', '7px'))
     html = html.replace('{{STATUS_SN_FONT}}', cfg_layout.get('status_sn_font', '13px'))
     html = html.replace('{{COL_CLASS_PCT}}', cfg_layout.get('col_class_pct', '44%'))
@@ -2591,12 +5763,111 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(content.encode('utf-8'))
                 return
 
+        if path in ('/js/jsqr.min.js', '/jsqr.min.js'):
+            js_path = os.path.join(os.path.dirname(__file__), 'jsqr.min.js')
+            if not os.path.exists(js_path):
+                js_path = os.path.join(config.LOCAL_DATA_DIR, 'jsqr.min.js')
+            if os.path.exists(js_path):
+                with open(js_path, 'rb') as f:
+                    js_bytes = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(js_bytes)
+                return
+
+        if path in ('/js/zxing.min.js', '/zxing.min.js'):
+            js_path = os.path.join(os.path.dirname(__file__), 'zxing.min.js')
+            if not os.path.exists(js_path):
+                js_path = os.path.join(config.LOCAL_DATA_DIR, 'zxing.min.js')
+            if os.path.exists(js_path):
+                with open(js_path, 'rb') as f:
+                    js_bytes = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(js_bytes)
+                return
+
         if path == '/api/status':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(LIVE_HUD_STATE).encode('utf-8'))
+            return
+
+        if path == '/api/mes_scan_sn' or path.startswith('/api/mes_scan_sn?'):
+            params = urllib.parse.parse_qs(parsed.query)
+            sn = params.get('sn', [''])[0].strip()
+            source = params.get('source', ['Mobile Scanner'])[0].strip()
+            clean_sn = clean_and_validate_sn(sn) or normalize_v01_candidate(sn) or (sn.strip().upper() if sn else "")
+            if clean_sn:
+                initial_entry = {
+                    "sn": clean_sn,
+                    "tumsoldering": "",
+                    "tumlayup": "",
+                    "tumlamination": "",
+                    "layup_time": "",
+                    "defect": f"Scanned via {source}",
+                    "result": "Pending MES"
+                }
+                save_mes_trend_entry(initial_entry)
+                query_res = query_mes_process_log(clean_sn)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(query_res).encode('utf-8'))
+                return
+            else:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "Invalid SN"}).encode('utf-8'))
+                return
+
+        if path == '/api/mes_query':
+            params = urllib.parse.parse_qs(parsed.query)
+            sn = params.get('sn', [''])[0].strip()
+            result = query_mes_process_log(sn)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+            return
+
+        if path == '/api/mes_trend':
+            analytics = get_mes_trend_analytics()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(analytics).encode('utf-8'))
+            return
+
+        if path == '/api/export_mes_trend_csv':
+            csv_data = export_mes_trend_csv_string()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/csv; charset=utf-8')
+            self.send_header('Content-Disposition', 'attachment; filename="MES_Process_Trend_Log.csv"')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(csv_data.encode('utf-8'))
+            return
+
+        if path == '/api/mes_dictionary':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(MES_CHINESE_DICTIONARY, ensure_ascii=False).encode('utf-8'))
             return
 
         if path.startswith('/photos/'):
@@ -2613,6 +5884,13 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                 return
 
         self.send_response(404)
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
     def do_POST(self):
@@ -2644,15 +5922,85 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                 parsed_url = urllib.parse.urlparse(self.path)
                 params = urllib.parse.parse_qs(parsed_url.query)
                 photo_hint = params.get('type', ['AUTO'])[0]
-                client_sn = params.get('client_sn', [''])[0].strip()
+                client_sn_raw = params.get('client_sn', [''])[0].strip()
+                client_sn = clean_and_validate_sn(client_sn_raw)
                 ts_str = params.get('timestamp', [None])[0]
                 file_dt = datetime.fromtimestamp(float(ts_str)) if ts_str else datetime.now()
+                target_tab = params.get('target_tab', [''])[0].lower()
+
+                # Strict Tab Isolation Guard: Never send MES scans to ModuleReviewTab
+                if target_tab == 'mes' or photo_hint == 'MES_PHOTO':
+                    length = int(self.headers.get('Content-Length', 0))
+                    saved_path = ""
+                    found_sn = client_sn
+
+                    if length > 0:
+                        img_bytes = self.rfile.read(length)
+                        ts_tag = int(time.time() * 1000)
+                        raw_fname = f"MES_Snap_{ts_tag}.jpg"
+                        tmp_save_path = os.path.join(LOCAL_UPLOADS_DIR, raw_fname)
+                        with open(tmp_save_path, 'wb') as f:
+                            f.write(img_bytes)
+
+                        # Normalize EXIF orientation on save
+                        try:
+                            from PIL import Image as PIL_Img, ImageOps as PIL_Ops
+                            with PIL_Img.open(tmp_save_path) as p_img:
+                                transposed = PIL_Ops.exif_transpose(p_img)
+                                if transposed is not None:
+                                    transposed.save(tmp_save_path, quality=95)
+                        except Exception: pass
+
+                        # If client_sn wasn't provided, try barcode/OCR extraction
+                        if not found_sn:
+                            found_sn = extract_sn_with_ocr(tmp_save_path)
+
+                        # Save into MES_PHOTOS_DIR and mirror to DailyCache/YYYY-MM-DD/mes_photos
+                        if found_sn:
+                            saved_path = rename_to_sn_pattern(tmp_save_path, "MES_SN", found_sn, MES_PHOTOS_DIR)
+                            daily_mes_dir = os.path.join(LOCAL_CACHE_DIR, "mes_photos")
+                            os.makedirs(daily_mes_dir, exist_ok=True)
+                            try:
+                                shutil.copy2(saved_path, os.path.join(daily_mes_dir, os.path.basename(saved_path)))
+                            except Exception: pass
+                        else:
+                            dest = os.path.join(MES_PHOTOS_DIR, raw_fname)
+                            try:
+                                shutil.move(tmp_save_path, dest)
+                                saved_path = dest
+                            except Exception:
+                                saved_path = tmp_save_path
+
+                        mark_photo_processed(saved_path, os.path.basename(saved_path))
+                        print(f"[MES PHOTO SAVED]: Saved MES photo to '{saved_path}', SN='{found_sn}'")
+
+                    if found_sn:
+                        initial_entry = {
+                            "sn": found_sn,
+                            "tumsoldering": "",
+                            "tumlayup": "",
+                            "tumlamination": "",
+                            "layup_time": "",
+                            "defect": "MES Barcode Photo" if length > 0 else "Mobile MES Sync",
+                            "result": "Pending MES",
+                            "photo_path": saved_path
+                        }
+                        save_mes_trend_entry(initial_entry)
+                        query_mes_process_log(found_sn)
+
+                    resp_data = {'status': 'ok', 'action': 'MES_PHOTO', 'sn': found_sn or '', 'photo_path': saved_path}
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+                    return
 
                 length = int(self.headers.get('Content-Length', 0))
                 if length == 0:
                     if client_sn:
                         # Direct SN sync from Mobile Hub without image file
-                        print(f"[MOBILE SN SYNC]: Received client_sn '{client_sn}'")
+                        print(f"[MOBILE SN SYNC]: Received valid client_sn '{client_sn}'")
                         if GLOBAL_APP_CALLBACK:
                             try:
                                 GLOBAL_APP_CALLBACK(
@@ -2671,8 +6019,13 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                         self.wfile.write(json.dumps(resp_data).encode('utf-8'))
                         return
                     else:
-                        self.send_response(400)
+                        print(f"[MOBILE SN SYNC REJECTED]: Rejected non-V01 barcode '{client_sn_raw}'")
+                        resp_data = {'status': 'rejected', 'reason': 'Invalid barcode. Must begin with V01.', 'sn': ''}
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Access-Control-Allow-Origin', '*')
                         self.end_headers()
+                        self.wfile.write(json.dumps(resp_data).encode('utf-8'))
                         return
 
                 img_bytes = self.rfile.read(length)
@@ -2692,7 +6045,7 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                 except Exception: pass
 
                 mark_photo_processed(raw_fname, save_path)
-                print(f"[MOBILE CAMERA SNAP]: Received {raw_fname} ({len(img_bytes)} bytes) Mode: {photo_hint} ClientSN: '{client_sn}'")
+                print(f"[MOBILE CAMERA SNAP]: Received {raw_fname} ({len(img_bytes)} bytes) Mode: {photo_hint} ClientSN: '{client_sn}' (Raw: '{client_sn_raw}')")
 
                 # Barcode / SN detection (Run ONLY for SN_PHOTO; skip completely for DEFECT_PHOTO)
                 found_sn = ""
@@ -2703,7 +6056,8 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                     if client_sn:
                         found_sn = client_sn
                     if not found_sn:
-                        found_sn = extract_sn_from_photo(save_path)
+                        found_sn = extract_sn_with_ocr(save_path)
+                    print(f"[SN PHOTO PROCESSED]: Extracted V01 SN -> '{found_sn}'")
 
                 final_path = save_path
                 if found_sn:
@@ -2751,9 +6105,12 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                 body = self.rfile.read(length).decode('utf-8')
                 data = json.loads(body)
                 
-                def_sn = data.get('sn', '').strip()
+                raw_sn = data.get('sn', '').strip()
+                def_sn = clean_and_validate_sn(raw_sn) or raw_sn
                 def_class = data.get('class', '')
                 def_summary = data.get('summary', '')
+                if not def_class and def_summary and hasattr(config, 'get_class_for_summary'):
+                    def_class = config.get_class_for_summary(def_summary)
                 def_result = data.get('result', 'Q3')
                 def_ts = data.get('timestamp', time.time())
                 def_dt = datetime.fromtimestamp(def_ts)
@@ -2789,6 +6146,216 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
 
             except Exception as e:
                 print(f"[MOBILE DEFECT ERROR]: {e}")
+                self.send_response(500)
+                self.end_headers()
+                return
+
+        if self.path.startswith('/api/mes_scan_sn'):
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                sn = ""
+                source = "Mobile Scan"
+                if length > 0:
+                    body = self.rfile.read(length).decode('utf-8', errors='ignore')
+                    try:
+                        data = json.loads(body)
+                        sn = data.get('sn', '')
+                        source = data.get('source', source)
+                    except Exception:
+                        sn = body.strip()
+                if not sn:
+                    parsed_url = urllib.parse.urlparse(self.path)
+                    params = urllib.parse.parse_qs(parsed_url.query)
+                    sn = params.get('sn', [''])[0].strip()
+                    source = params.get('source', [source])[0].strip()
+
+                clean_sn = clean_and_validate_sn(sn) or normalize_v01_candidate(sn) or (sn.strip().upper() if sn else "")
+                if clean_sn:
+                    initial_entry = {
+                        "sn": clean_sn,
+                        "tumsoldering": "",
+                        "tumlayup": "",
+                        "tumlamination": "",
+                        "layup_time": "",
+                        "defect": f"Scanned via {source}",
+                        "result": "Pending MES"
+                    }
+                    save_mes_trend_entry(initial_entry)
+                    query_res = query_mes_process_log(clean_sn)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(query_res).encode('utf-8'))
+                    return
+                else:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Invalid SN"}).encode('utf-8'))
+                    return
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                return
+
+        if self.path.startswith('/api/extract_sn_from_image'):
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                img_bytes = self.rfile.read(length)
+                tmp_fname = f"mes_snap_{int(time.time() * 1000)}.jpg"
+                tmp_path = os.path.join(MES_PHOTOS_DIR, tmp_fname)
+                with open(tmp_path, 'wb') as f:
+                    f.write(img_bytes)
+
+                # Normalize EXIF
+                try:
+                    from PIL import Image as PIL_Img, ImageOps as PIL_Ops
+                    with PIL_Img.open(tmp_path) as p_img:
+                        transposed = PIL_Ops.exif_transpose(p_img)
+                        if transposed is not None:
+                            transposed.save(tmp_path, quality=95)
+                except Exception: pass
+
+                # 1. Barcode / QR detection
+                found_sn = extract_sn_with_ocr(tmp_path)
+                
+                # 2. EasyOCR text detection on full image for MES screen photos
+                all_text = ""
+                reader = get_easyocr_reader()
+                if reader:
+                    try:
+                        lines = reader.readtext(tmp_path, detail=0)
+                        all_text = " ".join(lines)
+                        if not found_sn:
+                            for l in lines:
+                                norm = normalize_v01_candidate(l)
+                                if norm:
+                                    found_sn = norm
+                                    break
+                                cl = clean_and_validate_sn(l)
+                                if cl:
+                                    found_sn = cl
+                                    break
+                    except Exception as o_err:
+                        print(f"[OCR MES DETECT ERROR]: {o_err}")
+
+                # 3. Extract machines & process data if photo is of MES screen
+                parsed_mes = extract_info_from_mes_html(all_text, fallback_sn=found_sn)
+                final_sn = parsed_mes.get('sn') or found_sn
+
+                # 4. If photo was of module barcode (no machines in image text), automatically query FineReport MES portal!
+                if final_sn and (not parsed_mes.get('tumsoldering') and not parsed_mes.get('tumlayup')):
+                    print(f"[EXTRACT SN OCR]: Barcode detected for {final_sn}. Automatically querying FineReport MES platform...")
+                    try:
+                        auto_res = query_mes_process_log(final_sn, record_to_trend=True)
+                        if auto_res and auto_res.get('status') == 'ok':
+                            for k in ['tumsoldering', 'tumlayup', 'tumlamination', 'layup_time', 'product_family', 'lot_no', 'mo_no', 'appearance_grade', 'defect', 'result']:
+                                if auto_res.get(k):
+                                    parsed_mes[k] = auto_res[k]
+                            print(f"[AUTO MES LOGGED]: Extracted from FineReport -> Stringer='{parsed_mes.get('tumsoldering')}', Layup='{parsed_mes.get('tumlayup')}', Lam='{parsed_mes.get('tumlamination')}', LayupTime='{parsed_mes.get('layup_time')}'")
+                    except Exception as qe:
+                        print(f"[AUTO MES QUERY ERROR]: {qe}")
+
+                saved_path = tmp_path
+                if final_sn:
+                    saved_path = rename_to_sn_pattern(tmp_path, "MES_SN", final_sn, MES_PHOTOS_DIR)
+                    daily_mes_dir = os.path.join(LOCAL_CACHE_DIR, "mes_photos")
+                    os.makedirs(daily_mes_dir, exist_ok=True)
+                    try:
+                        shutil.copy2(saved_path, os.path.join(daily_mes_dir, os.path.basename(saved_path)))
+                    except Exception: pass
+                    mark_photo_processed(saved_path, os.path.basename(saved_path))
+                    parsed_mes['sn'] = final_sn
+                    parsed_mes['photo_path'] = saved_path
+                    save_mes_trend_entry(parsed_mes)
+
+                print(f"[EXTRACT SN/MES OCR]: Extracted from {tmp_fname} -> SN='{final_sn}', Soldering='{parsed_mes.get('tumsoldering')}', Layup='{parsed_mes.get('tumlayup')}', Lam='{parsed_mes.get('tumlamination')}', SavedTo='{saved_path}'")
+
+                resp_data = {
+                    'status': 'ok',
+                    'sn': final_sn or '',
+                    'photo_path': saved_path,
+                    'tumsoldering': parsed_mes.get('tumsoldering', ''),
+                    'tumlayup': parsed_mes.get('tumlayup', ''),
+                    'tumlamination': parsed_mes.get('tumlamination', ''),
+                    'layup_time': parsed_mes.get('layup_time', ''),
+                    'product_family': parsed_mes.get('product_family', ''),
+                    'lot_no': parsed_mes.get('lot_no', ''),
+                    'mo_no': parsed_mes.get('mo_no', ''),
+                    'appearance_grade': parsed_mes.get('appearance_grade', ''),
+                    'raw_found': parsed_mes.get('raw_found', False) or bool(parsed_mes.get('tumsoldering') or parsed_mes.get('tumlayup'))
+                }
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+                return
+            except Exception as e:
+                print(f"[EXTRACT SN OCR ERROR]: {e}")
+                self.send_response(500)
+                self.end_headers()
+                return
+
+        if self.path.startswith('/api/mes_query'):
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                sn = ""
+                if length > 0:
+                    body = self.rfile.read(length).decode('utf-8', errors='ignore')
+                    try:
+                        data = json.loads(body)
+                        sn = data.get('sn', '')
+                    except Exception:
+                        sn = body.strip()
+                if not sn:
+                    parsed_url = urllib.parse.urlparse(self.path)
+                    params = urllib.parse.parse_qs(parsed_url.query)
+                    sn = params.get('sn', [''])[0].strip()
+
+                result = query_mes_process_log(sn)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+                return
+            except Exception as e:
+                print(f"[MES POST QUERY ERROR]: {e}")
+                self.send_response(500)
+                self.end_headers()
+                return
+
+        if self.path.startswith('/api/extract_from_html'):
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                raw_html = ""
+                sn_hint = ""
+                if length > 0:
+                    body = self.rfile.read(length).decode('utf-8', errors='ignore')
+                    raw_html = body
+                    try:
+                        data = json.loads(body)
+                        if isinstance(data, dict):
+                            raw_html = data.get('content') or data.get('html', '')
+                            sn_hint = data.get('sn', '')
+                    except Exception:
+                        pass
+
+                parsed_data = extract_info_from_mes_html(raw_html, fallback_sn=sn_hint)
+                trend_data = get_mes_trend_analytics()
+                resp = {"status": "ok", "data": parsed_data, "trend": trend_data}
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(resp).encode('utf-8'))
+                return
+            except Exception as e:
+                print(f"[EXTRACT HTML ERROR]: {e}")
                 self.send_response(500)
                 self.end_headers()
                 return
@@ -2921,9 +6488,11 @@ def start_mobile_hud_server(port: int = 8080, ssl_port: int = 8443) -> str:
     return GLOBAL_HUD_URL
 
 
-def start_phone_server(callback_fn, defect_callback=None):
-    global GLOBAL_APP_CALLBACK
+def start_phone_server(callback_fn, defect_callback=None, mes_callback=None):
+    global GLOBAL_APP_CALLBACK, GLOBAL_MES_CALLBACK
     GLOBAL_APP_CALLBACK = callback_fn
+    if mes_callback is not None:
+        GLOBAL_MES_CALLBACK = mes_callback
     ensure_defect_sample_folders()
     scan_and_train_from_sample_folders()
     active_path = start_smart_today_copier(callback_fn)
@@ -2932,7 +6501,7 @@ def start_phone_server(callback_fn, defect_callback=None):
     # Start Mobile Live Web HUD (Dual HTTP :8080 and HTTPS :8443)
     hud_port = getattr(config, 'MOBILE_HUD_PORT', 8080)
     hud_url = start_mobile_hud_server(hud_port, 8443)
-    update_live_hud_state(defect_callback=defect_callback)
+    update_live_hud_state(defect_callback=defect_callback, mes_callback=mes_callback)
 
     cam_dirs, rec_dirs = find_phone_directories()
     phone_link_status = "Phone Link: Connected" if cam_dirs else "Phone Link: Watching"
