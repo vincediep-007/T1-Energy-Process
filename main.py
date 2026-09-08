@@ -2956,6 +2956,11 @@ class ModuleReviewTab(tk.Frame):
         except Exception:
             pass
 
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
     def query_pre_el(self, sn, session_dt):
         t_start_all = time.time()
         pre_stations = [f"{config.PRE_EL_STATION_PREFIX}{i}" for i in range(config.PRE_EL_STATION_MIN, config.PRE_EL_STATION_MAX + 1)]
@@ -3047,6 +3052,10 @@ class ModuleReviewTab(tk.Frame):
                         is_active = (self.selected_rec_id == rec_id) or (not self.selected_rec_id and self.records and self.records[0].get('id') == rec_id)
                         if is_active and ln and hasattr(self, 'cb_line'):
                             self.cb_line.set(ln)
+                        try:
+                            self.update_idletasks()
+                        except Exception:
+                            pass
                     except Exception as ex:
                         print(f"[PRE-EL UI UPDATE ERROR]: {ex}")
 
@@ -3177,6 +3186,8 @@ class ModuleReviewTab(tk.Frame):
         self.cb_class.set("")
         self.cb_result.set("")
         self.cb_cause.set("")
+        if hasattr(self, 'cb_line'):
+            self.cb_line.set("")
         self.ent_sn.focus_set()
 
     def clear_all_records(self):

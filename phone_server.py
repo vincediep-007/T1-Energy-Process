@@ -18,6 +18,7 @@ import json
 import re
 import html
 import shutil
+import subprocess
 import threading
 from datetime import datetime
 import cv2
@@ -381,6 +382,28 @@ def decode_qr_robust(cv_img) -> str:
             except Exception:
                 pass
 
+def decode_qr_fast(cv_img) -> str:
+    if cv_img is None or cv_img.size == 0:
+        return ""
+    if HAS_PYZBAR:
+        from pyzbar.pyzbar import ZBarSymbol
+        try:
+            for obj in pyzbar_decode(cv_img, symbols=[ZBarSymbol.QRCODE, ZBarSymbol.CODE128, ZBarSymbol.CODE39]):
+                raw = obj.data.decode('utf-8', errors='ignore').strip()
+                sn = clean_and_validate_sn(raw)
+                if sn:
+                    return sn
+        except Exception:
+            pass
+    try:
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(cv_img)
+        if data:
+            sn = clean_and_validate_sn(data)
+            if sn:
+                return sn
+    except Exception:
+        pass
     return ""
 
 
@@ -429,6 +452,124 @@ def get_easyocr_reader():
     return EASYOCR_READER if EASYOCR_READER is not False else None
 
 
+WINDOWS_OCR_PS1_SCRIPT = r"""param (
+    [Parameter(Mandatory=$true)]
+    [string]$ImagePath
+)
+
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    Function Await($WinRtTask, $ResultType) {
+        $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+        $netTask = $asTask.Invoke($null, @($WinRtTask))
+        $netTask.Wait(-1) | Out-Null
+        $netTask.Result
+    }
+
+    [Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Media.Ocr.OcrEngine,Windows.Foundation.UniversalApiContract,ContentType=WindowsRuntime] | Out-Null
+    [Windows.Graphics.Imaging.BitmapDecoder,Windows.Foundation.UniversalApiContract,ContentType=WindowsRuntime] | Out-Null
+
+    $resolvedPath = (Resolve-Path -LiteralPath $ImagePath).Path
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($resolvedPath)) ([Windows.Storage.StorageFile])
+    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    if ($null -eq $engine) {
+        $avail = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+        if ($avail.Count -gt 0) {
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($avail[0])
+        } else {
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US'))
+        }
+    }
+    $ocrResult = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    if ($ocrResult -and $ocrResult.Lines) {
+        foreach ($line in $ocrResult.Lines) {
+            Write-Output $line.Text
+        }
+    } elseif ($ocrResult) {
+        Write-Output $ocrResult.Text
+    }
+} catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
+"""
+
+def ensure_windows_ocr_script() -> str:
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "windows_ocr.ps1")
+    if not os.path.exists(script_path):
+        try:
+            with open(script_path, 'w', encoding='utf-8') as f:
+                f.write(WINDOWS_OCR_PS1_SCRIPT)
+        except Exception:
+            pass
+    return script_path
+
+
+def run_windows_native_ocr(image_path: str, try_rotations: bool = True) -> list:
+    """
+    Ultra-fast native Windows OCR using Windows.Media.Ocr.
+    Runs in ~0.4s on Windows 10/11 with zero external pip packages needed.
+    """
+    if os.name != 'nt' or not image_path or not os.path.exists(image_path):
+        return []
+
+    script_path = ensure_windows_ocr_script()
+
+    def _exec_ps_ocr(path_to_img: str) -> list:
+        try:
+            cmd = [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", script_path,
+                "-ImagePath", os.path.abspath(path_to_img)
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            if res.returncode == 0 and res.stdout:
+                return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        except Exception as err:
+            print(f"[WINDOWS OCR SUBPROCESS ERROR]: {err}")
+        return []
+
+    lines = _exec_ps_ocr(image_path)
+    for l in lines:
+        if normalize_v01_candidate(l) or clean_and_validate_sn(l):
+            return lines
+
+    if try_rotations and cv2 is not None:
+        try:
+            cv_img = cv2.imread(image_path)
+            if cv_img is not None:
+                import tempfile
+                rotations = [
+                    (cv2.ROTATE_90_CLOCKWISE, "90CW"),
+                    (cv2.ROTATE_180, "180"),
+                    (cv2.ROTATE_90_COUNTERCLOCKWISE, "270CW")
+                ]
+                for rot_code, rot_name in rotations:
+                    rot_mat = cv2.rotate(cv_img, rot_code)
+                    tmp_rot = os.path.join(tempfile.gettempdir(), f"ocr_rot_{rot_name}_{os.getpid()}.jpg")
+                    try:
+                        cv2.imwrite(tmp_rot, rot_mat)
+                        rot_lines = _exec_ps_ocr(tmp_rot)
+                        for r_l in rot_lines:
+                            if normalize_v01_candidate(r_l) or clean_and_validate_sn(r_l):
+                                print(f"[WINDOWS OCR ROTATION HIT {rot_name}]: '{r_l}'")
+                                return rot_lines
+                    finally:
+                        if os.path.exists(tmp_rot):
+                            try: os.remove(tmp_rot)
+                            except Exception: pass
+        except Exception as rot_err:
+            print(f"[WINDOWS OCR ROTATION ERROR]: {rot_err}")
+
+    return lines
+
+
 def normalize_v01_candidate(raw: str) -> str:
     """
     Normalizes candidate serial numbers from OCR, fixing common OCR letter/digit confusions
@@ -448,19 +589,70 @@ def normalize_v01_candidate(raw: str) -> str:
 
 def extract_sn_with_ocr(image_path: str) -> str:
     """
-    2-Way robust SN extraction:
-    1. First tries PyZbar and OpenCV multi-scale QR/Barcode detection.
-    2. Fallback to EasyOCR text recognition looking for 'V01...' patterns.
+    Ultra-fast 3-Way SN extraction:
+    1. Fast 1-Pass Barcode / QR detection (0.03s).
+    2. Native Windows.Media.Ocr (0.35s, zero pip packages needed).
+    3. Deep multi-scale Barcode / QR detection (pyzbar + OpenCV multi-pass).
+    4. Rotated Native Windows OCR.
+    5. EasyOCR fallback (if installed).
     """
     if not image_path or not os.path.exists(image_path):
         return ""
 
-    # 1. Barcode / QR detection
+    # 1. Fast 1-pass Barcode / QR detection (~0.03s)
+    try:
+        cv_img = cv2.imread(image_path)
+        if cv_img is not None:
+            fast_sn = decode_qr_fast(cv_img)
+            if fast_sn:
+                return fast_sn
+    except Exception:
+        pass
+
+    # 2. Native Windows.Media.Ocr (zero-dependency, ultra-fast ~0.35s)
+    try:
+        win_lines = run_windows_native_ocr(image_path, try_rotations=False)
+        for line in win_lines:
+            norm_sn = normalize_v01_candidate(line)
+            if norm_sn:
+                print(f"[WINDOWS OCR V01 SN DETECTED]: '{line}' -> '{norm_sn}'")
+                return norm_sn
+            sn_val = clean_and_validate_sn(line)
+            if sn_val:
+                print(f"[WINDOWS OCR SN DETECTED]: '{line}' -> '{sn_val}'")
+                return sn_val
+        if win_lines:
+            combined = " ".join(win_lines)
+            norm_sn = normalize_v01_candidate(combined)
+            if norm_sn:
+                print(f"[WINDOWS OCR COMBINED SN DETECTED]: '{norm_sn}'")
+                return norm_sn
+            sn_val = clean_and_validate_sn(combined)
+            if sn_val:
+                print(f"[WINDOWS OCR COMBINED SN DETECTED]: '{sn_val}'")
+                return sn_val
+    except Exception as win_ocr_err:
+        print(f"[WINDOWS OCR EXTRACT ERROR]: {win_ocr_err}")
+
+    # 3. Deep multi-scale Barcode / QR detection
     sn = extract_sn_from_photo(image_path)
     if sn:
         return sn
 
-    # 2. EasyOCR text detection
+    # 4. Rotated Native Windows OCR
+    try:
+        win_lines = run_windows_native_ocr(image_path, try_rotations=True)
+        for line in win_lines:
+            norm_sn = normalize_v01_candidate(line)
+            if norm_sn:
+                return norm_sn
+            sn_val = clean_and_validate_sn(line)
+            if sn_val:
+                return sn_val
+    except Exception:
+        pass
+
+    # 5. EasyOCR text detection fallback
     reader = get_easyocr_reader()
     if reader:
         try:
@@ -1650,27 +1842,61 @@ def extract_info_from_mes_html(raw_content: str, fallback_sn: str = "") -> dict:
         elif fallback_sn:
             sn = clean_and_validate_sn(fallback_sn) or normalize_v01_candidate(fallback_sn) or fallback_sn.strip().upper()
 
-    # 2. Soldering Machine (TUMSOLDERING1001-1042 -> Stringer101-706, 1099 remains TUMSOLDERING1099)
+    # 2. Soldering Machine (TUMSOLDERING1001-1042 -> Stringer101-706, prefer line stringer over 1099)
     soldering = ""
-    m_sol = re.search(r'\b(TUM\s*SOLD?E?RING[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(TUM\s*SOLD?E?RING[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE)
-    if m_sol:
-        soldering = normalize_soldering_machine(m_sol.group(1))
-    else:
-        m_str = re.search(r'\b(Stringer\s*[1-7]0[1-6])\b', text_content, re.IGNORECASE) or re.search(r'\b(Stringer\s*[1-7]0[1-6])\b', raw_content or '', re.IGNORECASE)
-        if m_str:
-            soldering = normalize_soldering_machine(m_str.group(1))
+    all_sols = (re.findall(r'\b(TUM\s*SOLD?E?RING[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) +
+                re.findall(r'\b(TUM\s*SOLD?E?RING[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE) +
+                re.findall(r'\b(Stringer\s*[1-7]0[1-6])\b', text_content, re.IGNORECASE) +
+                re.findall(r'\b(Stringer\s*[1-7]0[1-6])\b', raw_content or '', re.IGNORECASE))
+    prod_sols = []
+    fallback_sols = []
+    for cand in all_sols:
+        norm = normalize_soldering_machine(cand)
+        if norm:
+            if "1099" not in norm:
+                prod_sols.append(norm)
+            else:
+                fallback_sols.append(norm)
+    if prod_sols:
+        soldering = prod_sols[0]
+    elif fallback_sols:
+        soldering = fallback_sols[0]
 
-    # 3. Layup Machine (TUMLAYUP... remains unchanged)
+    # 3. Layup Machine (TUMLAYUP... prefer specific 1001-1014 over 1099)
     layup = ""
-    m_lay = re.search(r'\b(TUM\s*LAYUP[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(TUM\s*LAYUP[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE)
-    if m_lay:
-        layup = re.sub(r'\s+', '', m_lay.group(1)).upper()
+    all_lays = (re.findall(r'\b(TUM\s*LAYUP[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) +
+                re.findall(r'\b(TUM\s*LAYUP[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE))
+    prod_lays = []
+    fallback_lays = []
+    for l_cand in all_lays:
+        cl_lay = re.sub(r'\s+', '', l_cand).upper()
+        if cl_lay:
+            if "1099" not in cl_lay:
+                prod_lays.append(cl_lay)
+            else:
+                fallback_lays.append(cl_lay)
+    if prod_lays:
+        layup = prod_lays[0]
+    elif fallback_lays:
+        layup = fallback_lays[0]
 
-    # 4. Lamination Machine (TUMLAMINATION1001-1021 -> Lam1.1-21.2 & Deck Position, 1099 remains)
+    # 4. Lamination Machine (TUMLAMINATION1001-1021 -> Lam1.1-21.2 & Deck Position, prefer specific over 1099)
     lamination = ""
-    m_lam = re.search(r'\b(TUM\s*LAMINATION[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) or re.search(r'\b(TUM\s*LAMINATION[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE)
-    if m_lam:
-        lamination = normalize_lamination_machine(m_lam.group(1), full_context=text_content)
+    all_lams = (re.findall(r'\b(TUM\s*LAMINATION[\s_-]*[0-9A-Za-z_-]*)\b', raw_content or '', re.IGNORECASE) +
+                re.findall(r'\b(TUM\s*LAMINATION[\s_-]*[0-9A-Za-z_-]*)\b', text_content, re.IGNORECASE))
+    prod_lams = []
+    fallback_lams = []
+    for lam_c in all_lams:
+        n_lam = normalize_lamination_machine(lam_c, full_context=text_content)
+        if n_lam:
+            if "1099" not in n_lam:
+                prod_lams.append(n_lam)
+            else:
+                fallback_lams.append(n_lam)
+    if prod_lams:
+        lamination = prod_lams[0]
+    elif fallback_lams:
+        lamination = fallback_lams[0]
     else:
         lam_norm = normalize_lamination_machine("", full_context=text_content)
         if lam_norm:
@@ -2156,7 +2382,7 @@ def process_file_item(full_source_path, fname, callback_fn):
 
         # Photo Sync
         if ext in ('.jpg', '.jpeg', '.png', '.bmp'):
-            found_sn = extract_sn_from_photo(local_mirror_path)
+            found_sn = extract_sn_with_ocr(local_mirror_path)
             
             if found_sn:
                 if callback_fn:
@@ -6495,13 +6721,30 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                             transposed.save(tmp_path, quality=95)
                 except Exception: pass
 
-                # 1. Barcode / QR detection
+                # 1. Barcode / QR detection & Windows Native OCR
                 found_sn = extract_sn_with_ocr(tmp_path)
                 
-                # 2. EasyOCR text detection on full image for MES screen photos
+                # 2. Extract full text on image (Windows Native OCR + EasyOCR fallback) for MES screen photos
                 all_text = ""
+                try:
+                    win_lines = run_windows_native_ocr(tmp_path)
+                    if win_lines:
+                        all_text = " ".join(win_lines)
+                        if not found_sn:
+                            for l in win_lines:
+                                norm = normalize_v01_candidate(l)
+                                if norm:
+                                    found_sn = norm
+                                    break
+                                cl = clean_and_validate_sn(l)
+                                if cl:
+                                    found_sn = cl
+                                    break
+                except Exception as w_err:
+                    print(f"[WINDOWS OCR MES DETECT ERROR]: {w_err}")
+
                 reader = get_easyocr_reader()
-                if reader:
+                if reader and not all_text:
                     try:
                         lines = reader.readtext(tmp_path, detail=0)
                         all_text = " ".join(lines)
