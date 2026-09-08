@@ -69,6 +69,7 @@ LOCAL_CACHE_DIR = getattr(config, 'DAILY_CACHE_DIR', os.path.join(config.LOCAL_D
 VOICE_SAMPLES_DIR = getattr(config, 'VOICE_SAMPLES_DIR', os.path.join(config.LOCAL_DATA_DIR, "VoiceSamples"))
 LOCAL_UPLOADS_DIR = os.path.join(config.LOCAL_DATA_DIR, "PhoneUploads")
 MES_PHOTOS_DIR = getattr(config, 'MES_PHOTOS_DIR', os.path.join(config.LOCAL_DATA_DIR, "mes_photos"))
+MES_TREND_FILE = getattr(config, 'MES_TREND_FILE', os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend_log.json"))
 
 os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 os.makedirs(VOICE_SAMPLES_DIR, exist_ok=True)
@@ -652,6 +653,11 @@ def read_and_decode_mes_response(raw_bytes: bytes, tag: str = "") -> str:
     return raw_bytes.decode('utf-8', errors='ignore')
 
 
+MES_IN_FLIGHT_LOCK = threading.Lock()
+MES_IN_FLIGHT_EVENTS = {}
+MES_IN_FLIGHT_RESULTS = {}
+
+
 def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
     """
     Queries the Factory MES Reporting Platform (10.200.3.109:8080) for the specified module SN.
@@ -659,6 +665,10 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
       - TUMSOLDERING (Welding / 焊接)
       - TUMLAYUP (Lay up / 敷设) & Layup Operating Time
       - TUMLAMINATION (Lamination / 层压)
+    Includes:
+      1. Cache-First instant lookup (0 ms) from local persistent trend log
+      2. In-flight request deduplication to eliminate race conditions
+      3. Fast-Path direct Excel & HTML export (<1.5s response)
     """
     clean_sn = clean_and_validate_sn(sn) or (normalize_v01_candidate(sn) if sn else "") or (sn.strip().upper() if sn else "")
     if not clean_sn:
@@ -669,52 +679,113 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             "tumsoldering": "",
             "tumlayup": "",
             "tumlamination": "",
-            "layup_time": ""
+            "layup_time": "",
+            "raw_found": False
         }
 
-    base_url = "http://10.200.3.109:8080"
-    login_url = f"{base_url}/webroot/decision/login"
-    enc_sn = urllib.parse.quote(clean_sn)
-    enc_zh = urllib.parse.quote('组件序列号')
-    report_url = safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&{enc_zh}={enc_sn}")
-    direct_report_url = safe_ascii_url(f"{base_url}/webroot/decision#/?activeTab=416090fb-b706-40e8-9e4d-d698a059f6bf&{enc_zh}={enc_sn}")
+    # 0. Cache-First Instant Return (0 ms): If already in persistent log with machine data
+    cached = get_mes_trend_entry_by_sn(clean_sn)
+    if cached and (cached.get('tumsoldering') or cached.get('tumlayup') or cached.get('tumlamination') or cached.get('layup_time')):
+        print(f"[MES CACHE HIT]: SN='{clean_sn}' -> Soldering='{cached.get('tumsoldering')}', Layup='{cached.get('tumlayup')}', Lam='{cached.get('tumlamination')}'")
+        return {
+            "status": "ok",
+            "sn": clean_sn,
+            "tumsoldering": cached.get('tumsoldering', ''),
+            "tumlayup": cached.get('tumlayup', ''),
+            "tumlamination": cached.get('tumlamination', ''),
+            "layup_time": cached.get('layup_time', ''),
+            "product_family": cached.get('product_family', ''),
+            "lot_no": cached.get('lot_no', ''),
+            "mo_no": cached.get('mo_no', ''),
+            "appearance_grade": cached.get('appearance_grade', ''),
+            "defect": cached.get('defect', ''),
+            "result": cached.get('result', ''),
+            "raw_found": True
+        }
 
-    # 1. Check if 10.200.3.109 is reachable from this machine
-    reachable = False
+    # In-Flight Deduplication: Merge concurrent queries for the same SN into a single execution
+    is_primary = False
+    evt = None
+    with MES_IN_FLIGHT_LOCK:
+        if clean_sn in MES_IN_FLIGHT_EVENTS:
+            evt = MES_IN_FLIGHT_EVENTS[clean_sn]
+            is_primary = False
+        else:
+            evt = threading.Event()
+            MES_IN_FLIGHT_EVENTS[clean_sn] = evt
+            is_primary = True
+
+    if not is_primary and evt is not None:
+        print(f"[MES IN-FLIGHT JOIN]: Concurrent request for {clean_sn} waiting on active query...")
+        evt.wait(timeout=22.0)
+        with MES_IN_FLIGHT_LOCK:
+            res = MES_IN_FLIGHT_RESULTS.get(clean_sn)
+            if res:
+                return res
+        cached_after = get_mes_trend_entry_by_sn(clean_sn)
+        if cached_after and (cached_after.get('tumsoldering') or cached_after.get('tumlayup') or cached_after.get('tumlamination') or cached_after.get('layup_time')):
+            return {
+                "status": "ok",
+                "sn": clean_sn,
+                "tumsoldering": cached_after.get('tumsoldering', ''),
+                "tumlayup": cached_after.get('tumlayup', ''),
+                "tumlamination": cached_after.get('tumlamination', ''),
+                "layup_time": cached_after.get('layup_time', ''),
+                "product_family": cached_after.get('product_family', ''),
+                "lot_no": cached_after.get('lot_no', ''),
+                "mo_no": cached_after.get('mo_no', ''),
+                "appearance_grade": cached_after.get('appearance_grade', ''),
+                "defect": cached_after.get('defect', ''),
+                "result": cached_after.get('result', ''),
+                "raw_found": True
+            }
+
+    return_val = None
     try:
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2.5)
-            s.connect(("10.200.3.109", 8080))
-            reachable = True
-    except Exception:
-        reachable = False
+        base_url = "http://10.200.3.109:8080"
+        login_url = f"{base_url}/webroot/decision/login"
+        enc_sn = urllib.parse.quote(clean_sn)
+        enc_zh = urllib.parse.quote('组件序列号')
+        report_url = safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&{enc_zh}={enc_sn}")
+        direct_report_url = safe_ascii_url(f"{base_url}/webroot/decision#/?activeTab=416090fb-b706-40e8-9e4d-d698a059f6bf&{enc_zh}={enc_sn}")
 
-    if not reachable:
-        # Host PC is offline from factory LAN (running on office Wi-Fi)
-        if record_to_trend and clean_sn:
-            save_mes_trend_entry({
+        # 1. Check if 10.200.3.109 is reachable from this machine
+        reachable = False
+        try:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.5)
+                s.connect(("10.200.3.109", 8080))
+                reachable = True
+        except Exception:
+            reachable = False
+
+        if not reachable:
+            # Host PC is offline from factory LAN (running on office Wi-Fi)
+            if record_to_trend and clean_sn:
+                save_mes_trend_entry({
+                    "sn": clean_sn,
+                    "tumsoldering": "",
+                    "tumlayup": "",
+                    "tumlamination": "",
+                    "layup_time": "",
+                    "defect": "Offline PC (Auto-Synced via Mobile)",
+                    "result": "Pending MES"
+                })
+            return_val = {
+                "status": "offline_pc",
                 "sn": clean_sn,
                 "tumsoldering": "",
                 "tumlayup": "",
                 "tumlamination": "",
                 "layup_time": "",
-                "defect": "Offline PC (Auto-Synced via Mobile)",
-                "result": "Pending MES"
-            })
-        return {
-            "status": "offline_pc",
-            "sn": clean_sn,
-            "tumsoldering": "",
-            "tumlayup": "",
-            "tumlamination": "",
-            "layup_time": "",
-            "direct_report_url": direct_report_url,
-            "message": "Host PC is offline from factory LAN (10.200.3.109:8080 unreachable). Auto-extraction engaged on mobile."
-        }
+                "direct_report_url": direct_report_url,
+                "raw_found": False,
+                "message": "Host PC is offline from factory LAN (10.200.3.109:8080 unreachable). Auto-extraction engaged on mobile."
+            }
+            return return_val
 
-    # 2. Host PC is connected to factory LAN: perform automated login & query
-    try:
+        # 2. Host PC is connected to factory LAN: perform automated login & query
         import http.cookiejar
         cj = http.cookiejar.CookieJar()
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
@@ -725,7 +796,7 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             "Accept": "application/json, text/plain, */*"
         }
 
-        # Step A: Automated Login with username 030888, password 030888 (validity: -2 for 14-day session)
+        # Step A: Automated Login with username 030888, password 030888
         access_token = ""
         login_success = False
         login_endpoints = [
@@ -777,7 +848,6 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             except Exception as form_err:
                 print(f"[MES LOGIN FORM]: {form_err}")
 
-        # Step B: Query report with the clean SN
         cookie_parts = []
         if access_token:
             cookie_parts.append(f"fine_auth_token={access_token}")
@@ -795,6 +865,75 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             query_headers["Cookie"] = "; ".join(cookie_parts)
 
         token_param = f"&fine_auth_token={urllib.parse.quote(access_token)}" if access_token else ""
+        combined_html = ""
+
+        # Step B1: Fast-Path Direct Excel & HTML Export (Prioritize proven working endpoints)
+        fast_urls = [
+            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?op=export&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?op=export&format=html&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&op=export&format=html&__bypassevent__=true{token_param}")
+        ]
+
+        for f_u in fast_urls:
+            try:
+                f_req = urllib.request.Request(f_u, headers=query_headers)
+                with opener.open(f_req, timeout=3.8) as f_resp:
+                    f_raw = f_resp.read()
+                    f_chunk = read_and_decode_mes_response(f_raw, tag="FAST_PATH")
+                    if f_chunk:
+                        combined_html += " " + f_chunk
+                        if clean_sn in f_chunk and any(kw in f_chunk for kw in ("焊接", "敷设", "层压", "TUM", "SOL", "LAY", "LAM", "Stringer", "Lam")):
+                            print(f"[MES FAST-PATH HIT]: Found module data in {f_u[:75]}...")
+                            break
+            except Exception as f_err:
+                print(f"[MES FAST-PATH PROBE]: {f_err}")
+
+        # Check if fast-path already resolved the module
+        fast_parsed = extract_info_from_mes_html(combined_html, fallback_sn=clean_sn)
+        if fast_parsed.get('tumsoldering') or fast_parsed.get('tumlayup') or fast_parsed.get('tumlamination') or fast_parsed.get('layup_time'):
+            soldering = fast_parsed.get('tumsoldering', '')
+            layup = fast_parsed.get('tumlayup', '')
+            lamination = fast_parsed.get('tumlamination', '')
+            layup_time = fast_parsed.get('layup_time', '')
+            prod_family = fast_parsed.get('product_family', '')
+            lot_no = fast_parsed.get('lot_no', '')
+            mo_no = fast_parsed.get('mo_no', '')
+            grade = fast_parsed.get('appearance_grade', '')
+
+            print(f"[MES FAST-PATH PARSED]: SN='{clean_sn}' -> Soldering='{soldering}', Layup='{layup}', Lam='{lamination}', LayupTime='{layup_time}'")
+
+            if record_to_trend and clean_sn:
+                save_mes_trend_entry({
+                    "sn": clean_sn,
+                    "tumsoldering": soldering,
+                    "tumlayup": layup,
+                    "tumlamination": lamination,
+                    "layup_time": layup_time,
+                    "product_family": prod_family,
+                    "lot_no": lot_no,
+                    "mo_no": mo_no,
+                    "appearance_grade": grade,
+                    "defect": "MES Query: Found",
+                    "result": "Logged"
+                })
+
+            return_val = {
+                "status": "ok",
+                "sn": clean_sn,
+                "tumsoldering": soldering,
+                "tumlayup": layup,
+                "tumlamination": lamination,
+                "layup_time": layup_time,
+                "product_family": prod_family,
+                "lot_no": lot_no,
+                "mo_no": mo_no,
+                "appearance_grade": grade,
+                "raw_found": True
+            }
+            return return_val
+
+        # Step B2: Deep Probe Directory Entry & Sessions if fast path missed
         encoded_param_dict = {
             'MOUDLEID': clean_sn,
             'moudleid': clean_sn,
@@ -818,27 +957,14 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
         }
         param_string = urllib.parse.urlencode(encoded_param_dict)
 
-        # Probe Directory Entry for 416090fb-b706-40e8-9e4d-d698a059f6bf to find exact template path and session
         template_path = ""
         entry_endpoints = [
-            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true",
-            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true",
             f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true&MOUDLEID={clean_sn}&__bypassevent__=true",
-            f"{base_url}/webroot/decision/v10/directory/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/link/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/url/report/view?id=416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/url/mobile/view?id=416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/entry/visit/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/directory/entry/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/directory/entry/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/entry/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/directory/node/416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/directory/entry?id=416090fb-b706-40e8-9e4d-d698a059f6bf",
-            f"{base_url}/webroot/decision/v10/tabs/416090fb-b706-40e8-9e4d-d698a059f6bf"
+            f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf",
+            f"{base_url}/webroot/decision/link/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true",
+            f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true"
         ]
 
-        combined_html = ""
         known_sessions = set()
         known_templates = set()
 
@@ -855,7 +981,6 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
                     if body:
                         combined_html += " " + body
 
-                    # Check for session ID or CPT in body or redirected URL
                     entry_arts = parse_fr_artifacts(body)
                     url_arts = parse_fr_artifacts(final_url)
                     e_sess = entry_arts.get('session_id') or url_arts.get('session_id')
@@ -884,164 +1009,43 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             except Exception as ep_err:
                 print(f"[MES ENTRY ERR {ep[:50]}]: {ep_err}")
 
-        report_urls = [
-            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?op=export&format=html&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?op=export&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/link/416090fb-b706-40e8-9e4d-d698a059f6bf?MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/url/report/view?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&op=export&format=html&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true&{param_string}{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&op=export&format=html&{param_string}{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&{param_string}{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/form?id=416090fb-b706-40e8-9e4d-d698a059f6bf&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-            safe_ascii_url(f"{base_url}/webroot/decision/view/report?id=416090fb-b706-40e8-9e4d-d698a059f6bf&op=view&{param_string}{token_param}")
-        ]
+        # Active Session Parameter Injection & Content Fetch
+        for active_sid in list(known_sessions):
+            print(f"[MES ACTIVE SESSION]: ID='{active_sid}'")
+            param_post_urls = [
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_dialog&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=widget&widgetname=moudleid&sessionID={active_sid}&value={clean_sn}{token_param}"),
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=widget&widgetname=Search&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}")
+            ]
+            for p_u in param_post_urls:
+                try:
+                    p_req = urllib.request.Request(p_u, data=param_string.encode('utf-8'), headers=query_headers, method='POST')
+                    with opener.open(p_req, timeout=2.5) as p_resp:
+                        p_raw = p_resp.read()
+                        p_chunk = read_and_decode_mes_response(p_raw, tag="PARAM_POST")
+                        if p_chunk:
+                            combined_html += " " + p_chunk
+                except Exception:
+                    pass
 
-        if template_path:
-            enc_tpl = urllib.parse.quote(template_path)
-            report_urls.insert(0, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"))
-            report_urls.insert(1, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&op=export&format=html&{param_string}{token_param}"))
-            report_urls.insert(2, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&{param_string}{token_param}"))
-            report_urls.insert(3, safe_ascii_url(f"{base_url}/webroot/decision/view/form?viewlet={enc_tpl}&{param_string}{token_param}"))
-            report_urls.insert(4, safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_tpl}&op=page_content&pn=1&{param_string}{token_param}"))
-
-        if template_path:
-            known_templates.add(template_path)
-
-        for rep_u in report_urls:
-            try:
-                safe_rep_u = safe_ascii_url(rep_u)
-                r_req = urllib.request.Request(safe_rep_u, headers=query_headers)
-                with opener.open(r_req, timeout=3.5) as r_resp:
-                    raw_bytes = r_resp.read()
-                    chunk = read_and_decode_mes_response(raw_bytes, tag=safe_rep_u[:45])
-                    status_code = getattr(r_resp, 'status', 200)
-                    print(f"[MES FETCH]: {safe_rep_u[:95]}... -> status={status_code}, bytes={len(chunk)}")
-                    combined_html += " " + chunk
-
-                    # Parse runtime artifacts from response and final redirected URL
-                    artifacts = parse_fr_artifacts(chunk)
-                    url_arts = parse_fr_artifacts(r_resp.geturl())
-                    sess_id = artifacts.get('session_id') or url_arts.get('session_id')
-                    cpt = artifacts.get('cpt') or url_arts.get('cpt')
-                    iframe_src = artifacts.get('iframe_src')
-
-                    if sess_id or cpt or iframe_src:
-                        print(f"[MES DISCOVERY]: SessionID='{sess_id}', CPT='{cpt}', IFrame='{iframe_src}'")
-
-                    # Handle embedded iframe
-                    if iframe_src:
-                        try:
-                            if_full = urllib.parse.urljoin(base_url, iframe_src)
-                            sep = '&' if '?' in if_full else '?'
-                            if '__bypassevent__' not in if_full:
-                                if_full = f"{if_full}{sep}MOUDLEID={urllib.parse.quote(clean_sn)}&__bypassevent__=true&{param_string}{token_param}"
-                            else:
-                                if_full = f"{if_full}{sep}MOUDLEID={urllib.parse.quote(clean_sn)}&{param_string}{token_param}"
-                            safe_if = safe_ascii_url(if_full)
-                            with opener.open(urllib.request.Request(safe_if, headers=query_headers), timeout=3.0) as if_resp:
-                                if_raw = if_resp.read()
-                                if_chunk = read_and_decode_mes_response(if_raw, tag="IFRAME")
-                                if if_chunk:
-                                    combined_html += " " + if_chunk
-                                    print(f"[MES FETCH IFRAME]: {len(if_chunk)} bytes")
-                                    sub_arts = parse_fr_artifacts(if_chunk)
-                                    if sub_arts.get('session_id'):
-                                        sess_id = sub_arts['session_id']
-                                    if sub_arts.get('cpt'):
-                                        cpt = sub_arts['cpt']
-                        except Exception as if_err:
-                            print(f"[MES IFRAME ERROR]: {if_err}")
-
-                    # Handle newly discovered CPT template
-                    if cpt and cpt not in known_templates:
-                        known_templates.add(cpt)
-                        enc_cpt = urllib.parse.quote(cpt)
-                        cpt_endpoints = [
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_cpt}&MOUDLEID={clean_sn}&op=export&format=excel&extype=simple&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_cpt}&MOUDLEID={clean_sn}&op=export&format=html&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?viewlet={enc_cpt}&MOUDLEID={clean_sn}&__bypassevent__=true&{param_string}{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/form?viewlet={enc_cpt}&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}")
-                        ]
-                        for c_u in cpt_endpoints:
-                            try:
-                                with opener.open(urllib.request.Request(c_u, headers=query_headers), timeout=3.0) as c_resp:
-                                    c_raw = c_resp.read()
-                                    c_chunk = read_and_decode_mes_response(c_raw, tag=f"CPT_{cpt[:20]}")
-                                    if c_chunk:
-                                        combined_html += " " + c_chunk
-                                        print(f"[MES FETCH CPT {cpt}]: bytes={len(c_chunk)}")
-                            except Exception:
-                                pass
-
-                    # Handle sessionID
-                    target_sessions = list(known_sessions)
-                    if sess_id and sess_id not in known_sessions:
-                        target_sessions.append(sess_id)
-
-                    for active_sid in target_sessions:
-                        if active_sid in known_sessions and not sess_id:
-                            continue
-                        known_sessions.add(active_sid)
-                        print(f"[MES ACTIVE SESSION]: ID='{active_sid}'")
-
-                        # 1. Trigger parameter submission into active session with MOUDLEID
-                        param_post_urls = [
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_dialog&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision?op=fr_dialog&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=widget&widgetname=moudleid&sessionID={active_sid}&value={clean_sn}{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=widget&widgetname=Search&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=parameters_d&sessionID={active_sid}&MOUDLEID={clean_sn}{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_sheet&sessionID={active_sid}&pn=1&MOUDLEID={clean_sn}{token_param}")
-                        ]
-                        for p_u in param_post_urls:
-                            try:
-                                p_req = urllib.request.Request(p_u, data=param_string.encode('utf-8'), headers=query_headers, method='POST')
-                                with opener.open(p_req, timeout=2.5) as p_resp:
-                                    p_raw = p_resp.read()
-                                    p_chunk = read_and_decode_mes_response(p_raw, tag="PARAM_POST")
-                                    if p_chunk:
-                                        combined_html += " " + p_chunk
-                                        print(f"[MES POST SESSION PARAM]: status={getattr(p_resp, 'status', 200)}, bytes={len(p_chunk)}")
-                            except Exception:
-                                pass
-
-                        # 2. Fetch rendered content for Sheet 0 (Chinese) and Sheet 1 (English) + Excel & HTML export
-                        sess_content_endpoints = [
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=0&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=1&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=0&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=1&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=html&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision?op=export&sessionID={active_sid}&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision?op=export&sessionID={active_sid}&format=html&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=html{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=page_content&sessionID={active_sid}&pn=1&__bypassevent__=true{token_param}"),
-                            safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_sheet&sessionID={active_sid}&pn=1&__bypassevent__=true{token_param}")
-                        ]
-                        for s_u in sess_content_endpoints:
-                            try:
-                                with opener.open(urllib.request.Request(s_u, headers=query_headers), timeout=3.5) as s_resp:
-                                    s_raw = s_resp.read()
-                                    s_chunk = read_and_decode_mes_response(s_raw, tag=s_u[:40])
-                                    if s_chunk:
-                                        combined_html += " " + s_chunk
-                                        print(f"[MES FETCH CONTENT]: url={s_u[:65]}... -> bytes={len(s_chunk)}")
-                                        if clean_sn in s_chunk:
-                                            print(f"[MES FETCH SN HIT]: Found {clean_sn} in session content!")
-                            except Exception as c_err:
-                                print(f"[MES FETCH CONTENT ERR]: {c_err}")
-
-                    # If chunk contains data, break early
-                    if clean_sn in chunk and any(kw in chunk for kw in ("焊接", "敷设", "层压", "TUM", "SOL", "LAY", "LAM", "Stringer", "Lam")):
-                        print(f"[MES FETCH HIT]: Found module data in {safe_rep_u[:70]}...")
-                        break
-            except Exception as rep_err:
-                print(f"[MES FETCH PROBE ERROR]: {rep_err}")
+            sess_content_endpoints = [
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=excel&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=0&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=fr_view&cmd=view_content&sessionID={active_sid}&reportIndex=1&recal=true&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}"),
+                safe_ascii_url(f"{base_url}/webroot/decision/view/report?op=export&sessionID={active_sid}&format=html&extype=simple&MOUDLEID={clean_sn}&__bypassevent__=true{token_param}")
+            ]
+            for s_u in sess_content_endpoints:
+                try:
+                    with opener.open(urllib.request.Request(s_u, headers=query_headers), timeout=3.5) as s_resp:
+                        s_raw = s_resp.read()
+                        s_chunk = read_and_decode_mes_response(s_raw, tag=s_u[:40])
+                        if s_chunk:
+                            combined_html += " " + s_chunk
+                            if clean_sn in s_chunk and any(kw in s_chunk for kw in ("焊接", "敷设", "层压", "TUM", "SOL", "LAY", "LAM", "Stringer", "Lam")):
+                                print(f"[MES FETCH SN HIT]: Found module data in session {active_sid[:8]} content!")
+                                break
+                except Exception as c_err:
+                    print(f"[MES FETCH CONTENT ERR]: {c_err}")
 
         # Save response for floor diagnostics
         try:
@@ -1081,7 +1085,7 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
                 "result": "Logged" if found_any else "Pending MES"
             })
 
-        return {
+        return_val = {
             "status": "ok",
             "sn": clean_sn,
             "tumsoldering": soldering,
@@ -1094,17 +1098,31 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             "appearance_grade": grade,
             "raw_found": found_any
         }
+        return return_val
     except Exception as err:
         print(f"[MES QUERY ERROR]: {err}")
-        return {
+        return_val = {
             "status": "error",
             "sn": clean_sn,
             "tumsoldering": "",
             "tumlayup": "",
             "tumlamination": "",
             "layup_time": "",
+            "raw_found": False,
             "message": f"Query error: {err}"
         }
+        return return_val
+    finally:
+        if is_primary and evt is not None:
+            with MES_IN_FLIGHT_LOCK:
+                if return_val:
+                    MES_IN_FLIGHT_RESULTS[clean_sn] = return_val
+                evt.set()
+                def _cleanup():
+                    with MES_IN_FLIGHT_LOCK:
+                        MES_IN_FLIGHT_EVENTS.pop(clean_sn, None)
+                        MES_IN_FLIGHT_RESULTS.pop(clean_sn, None)
+                threading.Timer(6.0, _cleanup).start()
 
 
 # ================== MES BILINGUAL DICTIONARY & TRANSLATOR ==================
@@ -1497,8 +1515,8 @@ def normalize_lamination_machine(raw_val: str, full_context: str = "") -> str:
     if val_str in ("-", "None"):
         val_str = ""
 
-    # If already fully formatted as Lam..., keep it
-    if val_str and re.match(r'^Lam\d+(\.\d)?(\s*\(.*\))?$', val_str, re.IGNORECASE):
+    # If already fully formatted with bilingual deck/position, keep it
+    if val_str and re.match(r'^Lam\d+(\.\d)?\s*\([^)]*(?:Upper|Lower)[^)]*\)$', val_str, re.IGNORECASE):
         return val_str
 
     scope = f"{val_str} "
@@ -1516,7 +1534,8 @@ def normalize_lamination_machine(raw_val: str, full_context: str = "") -> str:
     is_lower = bool(re.search(r'(下层|Lower\s*Deck|\bLower\b)', scope, re.IGNORECASE))
     is_upper = bool(re.search(r'(上层|Upper\s*Deck|\bUpper\b)', scope, re.IGNORECASE))
 
-    m_mach = re.search(r'TUM\s*LAMINATION[\s_-]*(\d+)', val_str, re.IGNORECASE) or re.search(r'TUM\s*LAMINATION[\s_-]*(\d+)', scope, re.IGNORECASE)
+    m_mach = (re.search(r'(?:TUM\s*LAMINATION[\s_-]*|Lam\s*)(\d+)', val_str, re.IGNORECASE) or 
+              re.search(r'(?:TUM\s*LAMINATION[\s_-]*|Lam\s*)(\d+)', scope, re.IGNORECASE))
     if not m_mach:
         return val_str
 
@@ -1542,7 +1561,13 @@ def normalize_lamination_machine(raw_val: str, full_context: str = "") -> str:
 
         base_lam = f"Lam{n}{deck_suffix}"
         if pos_str:
-            return f"{base_lam} ({pos_str})"
+            pos_label = pos_str
+            if ("上层" in pos_label or "下层" in pos_label) and "(" not in pos_label:
+                deck_en = "Upper" if "上层" in pos_label else "Lower"
+                m_num = re.search(r'(\d+)', pos_label)
+                pos_num = m_num.group(1) if m_num else ""
+                pos_label = f"{pos_str} ({deck_en} {pos_num})" if pos_num else f"{pos_str} ({deck_en})"
+            return f"{base_lam} ({pos_label})"
         return base_lam
 
     return val_str
@@ -1698,6 +1723,18 @@ def load_mes_trend_log() -> list:
     return []
 
 
+def get_mes_trend_entry_by_sn(sn: str) -> dict:
+    if not sn:
+        return {}
+    clean_sn = clean_and_validate_sn(sn) or normalize_v01_candidate(sn) or (sn.strip().upper() if sn else "")
+    if not clean_sn:
+        return {}
+    for entry in load_mes_trend_log():
+        if entry.get("sn") == clean_sn:
+            return dict(entry)
+    return {}
+
+
 def save_mes_trend_entry(entry: dict) -> list:
     logs = load_mes_trend_log()
     sn = entry.get('sn', '').strip()
@@ -1756,7 +1793,23 @@ def save_mes_trend_entry(entry: dict) -> list:
     except Exception as e:
         print(f"[MES TREND LOG SAVE ERROR]: {e}")
 
-    global GLOBAL_MES_CALLBACK
+    # Broadcast to Mobile HUD State for instant 2-second background sync
+    LIVE_HUD_STATE["last_mes"] = {
+        "sn": final_record.get("sn", ""),
+        "tumsoldering": final_record.get("tumsoldering", ""),
+        "tumlayup": final_record.get("tumlayup", ""),
+        "tumlamination": final_record.get("tumlamination", ""),
+        "layup_time": final_record.get("layup_time", ""),
+        "product_family": final_record.get("product_family", ""),
+        "lot_no": final_record.get("lot_no", ""),
+        "mo_no": final_record.get("mo_no", ""),
+        "appearance_grade": final_record.get("appearance_grade", ""),
+        "defect": final_record.get("defect", ""),
+        "result": final_record.get("result", ""),
+        "timestamp": final_record.get("timestamp", ""),
+        "raw_found": bool(final_record.get("tumsoldering") or final_record.get("tumlayup") or final_record.get("tumlamination"))
+    }
+
     if GLOBAL_MES_CALLBACK:
         try:
             GLOBAL_MES_CALLBACK(final_record)
@@ -4073,17 +4126,10 @@ function setMESSerialNumber(sn, source = 'MES') {
   const badge = document.getElementById('mes-query-badge');
   if (badge) { badge.innerText = 'Auto-Querying MES...'; badge.style.color = '#38bdf8'; }
 
-  // 1. Immediately log to dedicated MES endpoint so desktop MESProcessLogTab gets this SN instantly!
-  try {
-    fetch(`/api/mes_scan_sn?sn=${encodeURIComponent(clean)}&source=${encodeURIComponent(source)}`);
-  } catch (e) {
-    console.warn('MES scan sync notice:', e);
-  }
-
-  // 2. Automated background login & prefetch to FineReport
+  // 1. Automated background login & prefetch to FineReport
   autoLoginFineReportOnPhone(clean);
 
-  // 3. Query MES process log details
+  // 2. Query MES process log details (synchronizes UI, trend log, and desktop)
   if (typeof queryMESProcessLog === 'function') {
     queryMESProcessLog(clean);
   }
@@ -4726,11 +4772,21 @@ async function captureAndUploadLiveFrame(video, detectedSN) {
       const ts = (Date.now() / 1000).toFixed(3);
       const snParam = `&client_sn=${encodeURIComponent(detectedSN)}`;
       const targetParam = isMes ? `&type=MES_PHOTO&target_tab=mes` : `&type=SN_PHOTO&target_tab=control`;
-      await fetch(`/api/upload_photo?timestamp=${ts}${snParam}${targetParam}`, {
+      const resp = await fetch(`/api/upload_photo?timestamp=${ts}${snParam}${targetParam}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: blob
       });
+      if (resp.ok && isMes) {
+        try {
+          const upData = await resp.json();
+          if (upData && (upData.raw_found || upData.tumsoldering || upData.tumlayup || upData.tumlamination)) {
+            if (typeof applyMESDataToUI === 'function') {
+              applyMESDataToUI(upData);
+            }
+          }
+        } catch (jsonErr) {}
+      }
     } catch(e) {
       console.warn('Live snapshot upload error:', e);
     }
@@ -5051,6 +5107,20 @@ async function fetchDashboardStatus() {
           <span class="pill ${r.result === 'Scrap' ? 'pill-scrap' : 'pill-q3'}" style="font-size: 10px; padding: 2px 6px;">${r.result}</span>
         </div>
       `).join('');
+    if (data.last_mes && data.last_mes.sn) {
+      const mesInput = document.getElementById('mes-sn-input');
+      const curVal = (mesInput ? mesInput.value.trim() : '') || currentMESSN || '';
+      if (!curVal || curVal === data.last_mes.sn || (currentMESSN && currentMESSN === data.last_mes.sn)) {
+        if (!curVal && mesInput) {
+          mesInput.value = data.last_mes.sn;
+          currentMESSN = data.last_mes.sn;
+        }
+        if (data.last_mes.raw_found || data.last_mes.tumsoldering || data.last_mes.tumlayup || data.last_mes.tumlamination) {
+          if (typeof applyMESDataToUI === 'function') {
+            applyMESDataToUI(data.last_mes);
+          }
+        }
+      }
     }
 
     const syncEl = document.getElementById('sync-status');
@@ -5156,12 +5226,9 @@ async function onMESPhotoCaptured(e) {
       const data = await res.json();
       if (!detectedSN && data.sn) detectedSN = data.sn;
       if (data.tumsoldering || data.tumlayup || data.tumlamination || data.layup_time) {
-        if (badge) { badge.innerText = 'Screen OCR Loaded'; badge.style.color = '#10b981'; }
-        updateHighlightCard('soldering', data.tumsoldering);
-        updateHighlightCard('layup', data.tumlayup, data.layup_time);
-        updateHighlightCard('lamination', data.tumlamination);
-        if (data.layup_time) setTxt('panel-layup', data.layup_time);
-        fetchMESTrendAnalytics();
+        if (typeof applyMESDataToUI === 'function') {
+          applyMESDataToUI(data);
+        }
         showToast('✅ Machine details extracted from screen photo!');
       }
     }
@@ -5181,6 +5248,65 @@ async function onMESPhotoCaptured(e) {
   }
 }
 
+function applyMESDataToUI(data) {
+  if (!data) return;
+  const badge = document.getElementById('mes-query-badge');
+  const hasMachines = !!(data.raw_found || data.tumsoldering || data.tumlayup || data.tumlamination);
+  
+  if (hasMachines) {
+    if (badge) {
+      badge.innerText = 'Logsheet Retrieved';
+      badge.style.color = '#10b981';
+    }
+  } else if (data.status === 'ok') {
+    if (badge) {
+      badge.innerText = 'No Record for SN';
+      badge.style.color = '#f59e0b';
+    }
+  }
+
+  updateHighlightCard('soldering', data.tumsoldering);
+  updateHighlightCard('layup', data.tumlayup, data.layup_time);
+  updateHighlightCard('lamination', data.tumlamination);
+
+  if (data.layup_time) {
+    const layupEl = document.getElementById('panel-layup');
+    if (layupEl) layupEl.innerText = data.layup_time;
+  }
+
+  if (data.product_family || data.lot_no || data.mo_no || data.appearance_grade) {
+    const extraBox = document.getElementById('mes-extra-details');
+    if (extraBox) {
+      extraBox.style.display = 'block';
+      const setSpan = (id, val) => { const el = document.getElementById(id); if (el) el.innerText = val || '-'; };
+      setSpan('mes-extra-family', data.product_family);
+      setSpan('mes-extra-lot', data.lot_no);
+      setSpan('mes-extra-mo', data.mo_no);
+      setSpan('mes-extra-grade', data.appearance_grade);
+    }
+  }
+
+  if (typeof fetchMESTrendAnalytics === 'function') {
+    fetchMESTrendAnalytics();
+  }
+}
+
+async function pollMESResultUntilFound(sn, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const res = await fetch(`/api/mes_query?sn=${encodeURIComponent(sn)}`);
+      if (res.ok) {
+        const d = await res.json();
+        if (d && (d.raw_found || d.tumsoldering || d.tumlayup || d.tumlamination)) {
+          return d;
+        }
+      }
+    } catch(e) {}
+  }
+  return null;
+}
+
 async function queryMESProcessLog(sn) {
   if (!sn) {
     const mesInput = document.getElementById('mes-sn-input');
@@ -5190,6 +5316,10 @@ async function queryMESProcessLog(sn) {
   if (!cleanSN) {
     return;
   }
+
+  currentMESSN = cleanSN;
+  const mesInput = document.getElementById('mes-sn-input');
+  if (mesInput && mesInput.value !== cleanSN) mesInput.value = cleanSN;
 
   const badge = document.getElementById('mes-query-badge');
   if (badge) { badge.innerText = 'Auto-Querying MES...'; badge.style.color = '#38bdf8'; }
@@ -5203,23 +5333,7 @@ async function queryMESProcessLog(sn) {
     if (res.ok) {
       const data = await res.json();
       if (data.status === 'ok' && (data.raw_found || data.tumsoldering || data.tumlayup || data.tumlamination)) {
-        if (badge) { badge.innerText = 'Logsheet Retrieved'; badge.style.color = '#10b981'; }
-        updateHighlightCard('soldering', data.tumsoldering);
-        updateHighlightCard('layup', data.tumlayup, data.layup_time);
-        updateHighlightCard('lamination', data.tumlamination);
-        if (data.layup_time) setTxt('panel-layup', data.layup_time);
-        if (data.product_family || data.lot_no || data.mo_no || data.appearance_grade) {
-          const extraBox = document.getElementById('mes-extra-details');
-          if (extraBox) {
-            extraBox.style.display = 'block';
-            const setSpan = (id, val) => { const el = document.getElementById(id); if (el) el.innerText = val || '-'; };
-            setSpan('mes-extra-family', data.product_family);
-            setSpan('mes-extra-lot', data.lot_no);
-            setSpan('mes-extra-mo', data.mo_no);
-            setSpan('mes-extra-grade', data.appearance_grade);
-          }
-        }
-        fetchMESTrendAnalytics();
+        applyMESDataToUI(data);
         showToast('✅ Auto-extracted from FineReport!');
         return;
       } else if (data.status === 'offline_pc') {
@@ -5240,11 +5354,7 @@ async function queryMESProcessLog(sn) {
               if (resExt.ok) {
                 const extData = (await resExt.json()).data || {};
                 if (extData.tumsoldering || extData.tumlayup || extData.tumlamination) {
-                  updateHighlightCard('soldering', extData.tumsoldering);
-                  updateHighlightCard('layup', extData.tumlayup, extData.layup_time);
-                  updateHighlightCard('lamination', extData.tumlamination);
-                  if (extData.layup_time) setTxt('panel-layup', extData.layup_time);
-                  fetchMESTrendAnalytics();
+                  applyMESDataToUI(extData);
                   if (badge) { badge.innerText = 'Auto-Extracted via Wi-Fi'; badge.style.color = '#10b981'; }
                   showToast('✅ Auto-extracted from FineReport via Phone Wi-Fi!');
                   return;
@@ -5269,11 +5379,14 @@ async function queryMESProcessLog(sn) {
         showToast('🖥️ Auto-loaded in In-Page Viewer below!');
         return;
       } else {
-        if (badge) { badge.innerText = data.raw_found ? 'Logsheet Retrieved' : 'No Record for SN'; badge.style.color = data.raw_found ? '#10b981' : '#f59e0b'; }
-        updateHighlightCard('soldering', data.tumsoldering);
-        updateHighlightCard('layup', data.tumlayup, data.layup_time);
-        updateHighlightCard('lamination', data.tumlamination);
-        if (data.layup_time) setTxt('panel-layup', data.layup_time);
+        // Check if in-flight query resolves within a few seconds
+        const pollResult = await pollMESResultUntilFound(cleanSN, 3);
+        if (pollResult && (pollResult.raw_found || pollResult.tumsoldering || pollResult.tumlayup || pollResult.tumlamination)) {
+          applyMESDataToUI(pollResult);
+          showToast('✅ Auto-extracted from FineReport!');
+          return;
+        }
+        applyMESDataToUI(data);
         return;
       }
     }
@@ -5807,17 +5920,7 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
             source = params.get('source', ['Mobile Scanner'])[0].strip()
             clean_sn = clean_and_validate_sn(sn) or normalize_v01_candidate(sn) or (sn.strip().upper() if sn else "")
             if clean_sn:
-                initial_entry = {
-                    "sn": clean_sn,
-                    "tumsoldering": "",
-                    "tumlayup": "",
-                    "tumlamination": "",
-                    "layup_time": "",
-                    "defect": f"Scanned via {source}",
-                    "result": "Pending MES"
-                }
-                save_mes_trend_entry(initial_entry)
-                query_res = query_mes_process_log(clean_sn)
+                query_res = query_mes_process_log(clean_sn, record_to_trend=True)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -5974,23 +6077,43 @@ class MobileHUDHTTPHandler(BaseHTTPRequestHandler):
                         mark_photo_processed(saved_path, os.path.basename(saved_path))
                         print(f"[MES PHOTO SAVED]: Saved MES photo to '{saved_path}', SN='{found_sn}'")
 
+                    query_res = {}
                     if found_sn:
-                        initial_entry = {
-                            "sn": found_sn,
-                            "tumsoldering": "",
-                            "tumlayup": "",
-                            "tumlamination": "",
-                            "layup_time": "",
-                            "defect": "MES Barcode Photo" if length > 0 else "Mobile MES Sync",
-                            "result": "Pending MES",
-                            "photo_path": saved_path
-                        }
-                        save_mes_trend_entry(initial_entry)
-                        query_mes_process_log(found_sn)
+                        existing = get_mes_trend_entry_by_sn(found_sn)
+                        if existing:
+                            existing["photo_path"] = saved_path
+                            save_mes_trend_entry(existing)
+                        else:
+                            initial_entry = {
+                                "sn": found_sn,
+                                "tumsoldering": "",
+                                "tumlayup": "",
+                                "tumlamination": "",
+                                "layup_time": "",
+                                "defect": "MES Barcode Photo" if length > 0 else "Mobile MES Sync",
+                                "result": "Pending MES",
+                                "photo_path": saved_path
+                            }
+                            save_mes_trend_entry(initial_entry)
+                        query_res = query_mes_process_log(found_sn, record_to_trend=True)
 
-                    resp_data = {'status': 'ok', 'action': 'MES_PHOTO', 'sn': found_sn or '', 'photo_path': saved_path}
+                    resp_data = {
+                        'status': 'ok',
+                        'action': 'MES_PHOTO',
+                        'sn': found_sn or '',
+                        'photo_path': saved_path,
+                        'tumsoldering': query_res.get('tumsoldering', ''),
+                        'tumlayup': query_res.get('tumlayup', ''),
+                        'tumlamination': query_res.get('tumlamination', ''),
+                        'layup_time': query_res.get('layup_time', ''),
+                        'product_family': query_res.get('product_family', ''),
+                        'lot_no': query_res.get('lot_no', ''),
+                        'mo_no': query_res.get('mo_no', ''),
+                        'appearance_grade': query_res.get('appearance_grade', ''),
+                        'raw_found': query_res.get('raw_found', False)
+                    }
                     self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     self.wfile.write(json.dumps(resp_data).encode('utf-8'))

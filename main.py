@@ -778,6 +778,8 @@ class MESProcessLogTab(tk.Frame):
         self.sort_reverse = True
         self.setup_ui()
         self.load_records()
+        self.last_trend_mtime = 0
+        self._poll_log_file()
 
     def setup_ui(self):
         # 1. Top Bar: Title, Subtitle, and Global Action Buttons
@@ -954,6 +956,17 @@ class MESProcessLogTab(tk.Frame):
         self.load_records()
         self.lbl_query_status.config(text="Log refreshed", fg="#059669")
 
+    def _poll_log_file(self):
+        try:
+            if os.path.exists(MES_TREND_FILE):
+                mtime = os.path.getmtime(MES_TREND_FILE)
+                if mtime > self.last_trend_mtime:
+                    self.last_trend_mtime = mtime
+                    self.load_records()
+        except Exception:
+            pass
+        self.after(2000, self._poll_log_file)
+
     def handle_incoming_mes_record(self, data):
         if not data or not isinstance(data, dict): return
         sn = data.get('sn', '').strip()
@@ -1007,7 +1020,7 @@ class MESProcessLogTab(tk.Frame):
         # Sorting
         def _sort_key(item):
             val = item.get(self.sort_col, '')
-            if self.sort_col == 'time': val = item.get('layup_time') or item.get('timestamp', '')
+            if self.sort_col == 'time': val = item.get('timestamp') or item.get('layup_time', '')
             return str(val).lower()
 
         filtered.sort(key=_sort_key, reverse=self.sort_reverse)
@@ -1091,13 +1104,25 @@ class MESProcessLogTab(tk.Frame):
             messagebox.showwarning("Invalid SN", "Please enter a valid Module Serial Number starting with V01.")
             return
 
+        # Check in-memory records first for instant display
+        for r in self.records:
+            if r.get('sn') == sn and (r.get('tumsoldering') or r.get('tumlayup') or r.get('tumlamination')):
+                lt_info = f" ({r.get('layup_time')})" if r.get('layup_time') else ""
+                sol = r.get('tumsoldering', '')
+                lay = r.get('tumlayup', '')
+                lam = r.get('tumlamination', '')
+                mach_str = " | ".join([m for m in [sol, lay, lam] if m])
+                self.lbl_query_status.config(text=f"✅ Found (cached): {mach_str}{lt_info}", fg="#059669")
+                return
+
         self.lbl_query_status.config(text=f"Logging in (030888) & Querying MES for {sn}...", fg="#2563eb")
 
         def _worker():
             try:
                 res = query_mes_process_log(sn)
                 def _ui():
-                    if res.get('raw_found'):
+                    has_mach = bool(res.get('raw_found') or res.get('tumsoldering') or res.get('tumlayup') or res.get('tumlamination'))
+                    if has_mach:
                         lt_info = f" ({res.get('layup_time')})" if res.get('layup_time') else ""
                         sol = res.get('tumsoldering', '')
                         lay = res.get('tumlayup', '')
