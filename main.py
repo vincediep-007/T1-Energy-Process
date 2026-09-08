@@ -35,7 +35,7 @@ from search_engine import ImageSearchEngine
 from image_processor import ImageProcessor
 from data_manager import DataManager, sync_to_master_excel
 
-from shift_calculator import get_responsible_shift_and_line, get_evaluation_shift
+from shift_calculator import get_responsible_shift_and_line, get_evaluation_shift, parse_line_from_station
 from phone_server import (
     start_phone_server, train_voice_pattern, test_mac_mini_relay_connection,
     get_file_datetime, refresh_save_folders_for_today, update_live_hud_state,
@@ -222,6 +222,70 @@ class ResultCard(tk.Frame):
         lbl_fname.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _on_click(self): self.callback(self.image_info['path'])
+
+class StringBlackCard(tk.Frame):
+    def __init__(self, parent, item, callback_click):
+        super().__init__(parent, bg=config.COLOR_CARD_BG, highlightbackground=config.COLOR_CARD_BORDER, highlightthickness=1)
+        self.item = item
+        self.callback = callback_click
+
+        sn = item.get('sn', 'Unknown')
+        station = item.get('station', '')
+        line = parse_line_from_station(station) or station
+        dt = item.get('datetime')
+        if isinstance(dt, datetime):
+            time_str = dt.strftime("%H:%M:%S")
+        else:
+            time_str = str(item.get('datetime_str', ''))[11:19]
+            
+        dark_pct = item.get('dark_pct', 0.0)
+        male = item.get('male', False)
+        middle = item.get('middle', False)
+        female = item.get('female', False)
+        fname = item.get('filename', '')
+        fpath = item.get('path', '')
+
+        p = tk.Frame(self, bg=config.COLOR_CARD_BG, padx=10, pady=8)
+        p.pack(fill=tk.BOTH, expand=True)
+
+        # Row 1: Line Badge, Station, Timestamp
+        r1 = tk.Frame(p, bg=config.COLOR_CARD_BG)
+        r1.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(r1, text=f" {line} ", font=("Segoe UI", 9, "bold"), bg="#e0f2fe", fg="#0369a1", bd=1, relief=tk.SOLID).pack(side=tk.LEFT)
+        tk.Label(r1, text=f"  {station}", font=("Segoe UI", 8), bg=config.COLOR_CARD_BG, fg=config.COLOR_TEXT_SECONDARY).pack(side=tk.LEFT)
+        tk.Label(r1, text=time_str, font=("Segoe UI", 8, "bold"), bg=config.COLOR_CARD_BG, fg="#475569").pack(side=tk.RIGHT)
+
+        # Row 2: Serial Number & Dark %
+        r2 = tk.Frame(p, bg=config.COLOR_CARD_BG)
+        r2.pack(fill=tk.X, pady=(2, 4))
+        lbl_sn = SelectableLabel(r2, text=sn, font=("Segoe UI", 11, "bold"), bg=config.COLOR_CARD_BG, fg=config.COLOR_PRIMARY)
+        lbl_sn.pack(side=tk.LEFT)
+
+        dark_badge_bg = "#fee2e2" if dark_pct >= 50 else "#fef3c7"
+        dark_badge_fg = "#b91c1c" if dark_pct >= 50 else "#b45309"
+        lbl_dark = tk.Label(r2, text=f" Dark: {dark_pct}% ", font=("Segoe UI", 8, "bold"), bg=dark_badge_bg, fg=dark_badge_fg, bd=1, relief=tk.SOLID)
+        lbl_dark.pack(side=tk.RIGHT)
+
+        # Row 3: Zone Badges (Male, Mid, Female)
+        r3 = tk.Frame(p, bg=config.COLOR_CARD_BG)
+        r3.pack(fill=tk.X, pady=(2, 6))
+        if male:
+            tk.Label(r3, text=" Top Zone (Male) ", font=("Segoe UI", 8, "bold"), bg="#fecdd3", fg="#be123c", bd=1, relief=tk.SOLID).pack(side=tk.LEFT, padx=(0, 4))
+        if middle:
+            tk.Label(r3, text=" Mid Zone ", font=("Segoe UI", 8, "bold"), bg="#fed7aa", fg="#c2410c", bd=1, relief=tk.SOLID).pack(side=tk.LEFT, padx=(0, 4))
+        if female:
+            tk.Label(r3, text=" Bot Zone (Female) ", font=("Segoe UI", 8, "bold"), bg="#e9d5ff", fg="#7e22ce", bd=1, relief=tk.SOLID).pack(side=tk.LEFT)
+
+        # Row 4: Action button & filename
+        r4 = tk.Frame(p, bg=config.COLOR_CARD_BG)
+        r4.pack(fill=tk.X, pady=(4, 0))
+        btn_view = tk.Button(r4, text="🖼️ Open EL Image", font=("Segoe UI", 8, "bold"), bg=config.COLOR_PRIMARY, fg="white",
+                             activebackground="#0e4b70", activeforeground="white", relief=tk.FLAT, bd=0, padx=8, pady=3, cursor="hand2",
+                             command=lambda: self.callback(fpath))
+        btn_view.pack(side=tk.RIGHT)
+
+        lbl_fn = SelectableLabel(r4, text=fname, font=("Segoe UI", 7), bg=config.COLOR_CARD_BG, fg=config.COLOR_TEXT_SECONDARY)
+        lbl_fn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
 # =================== TOP 5 & NON-EQUIPMENT SCRAP TAB ===================
 
@@ -3361,7 +3425,7 @@ class TabContent(tk.Frame):
         row2 = tk.Frame(filters, bg=config.COLOR_BG_MAIN)
         row2.pack(fill=tk.X, pady=(0, 4))
 
-        def create_date_picker(parent_widget, label, default_days_back=0):
+        def create_date_picker(parent_widget, label, default_days_back=0, on_change=None):
             container = tk.Frame(parent_widget, bg=config.COLOR_BG_MAIN)
             container.pack(side=tk.LEFT, padx=(0, 10), anchor="n")
             tk.Label(container, text=label, font=config.FONT_SMALL, bg=config.COLOR_BG_MAIN, fg=config.COLOR_TEXT_SECONDARY).pack(anchor=tk.W)
@@ -3371,12 +3435,19 @@ class TabContent(tk.Frame):
             cb.insert(0, default_date.strftime("%Y-%m-%d"))
             cb.config(state="readonly", readonlybackground=config.COLOR_INPUT_BG)
             cb.pack(pady=(2, 0))
-            cb.bind("<Button-1>", lambda e: CalendarDialog(self.app.root, current_date=val_holder['date'], anchor_widget=cb, callback=lambda d: (val_holder.update({'date': d}), cb.config(state='normal'), cb.delete(0, tk.END), cb.insert(0, d.strftime('%Y-%m-%d')), cb.config(state='readonly'))))
+            def _on_pick(d):
+                val_holder.update({'date': d})
+                cb.config(state='normal')
+                cb.delete(0, tk.END)
+                cb.insert(0, d.strftime('%Y-%m-%d'))
+                cb.config(state='readonly')
+                if on_change: on_change()
+            cb.bind("<Button-1>", lambda e: CalendarDialog(self.app.root, current_date=val_holder['date'], anchor_widget=cb, callback=_on_pick))
             return val_holder
 
         days_back_start = getattr(config, 'DEFAULT_PRE_FINAL_DAYS_BACK_START', 4) if self.mode != "STRING_BLACK" else 0
-        self.date_from_val = create_date_picker(row2, "From Date", days_back_start)
-        self.date_to_val = create_date_picker(row2, "To Date", 0)
+        self.date_from_val = create_date_picker(row2, "From Date", days_back_start, on_change=lambda: self.render_string_black_dashboard() if self.mode == "STRING_BLACK" else None)
+        self.date_to_val = create_date_picker(row2, "To Date", 0, on_change=lambda: self.render_string_black_dashboard() if self.mode == "STRING_BLACK" else None)
 
 
 
@@ -3567,10 +3638,241 @@ class TabContent(tk.Frame):
             btn_hist = ModernButton(history_container, text=f"🕒 Show All {pass_count} Historical Passes ▼", command=lambda: toggle_history(btn_hist), primary=False, padx=10, pady=4)
             btn_hist.pack(anchor="w", padx=6, pady=4)
 
+    def _draw_sb_bar_chart(self, canvas, c_w, c_h, data_pairs, bar_color="#1a5b82", title=""):
+        pad_l, pad_r, pad_t, pad_b = 45, 20, 25, 35
+        plot_w, plot_h = c_w - pad_l - pad_r, c_h - pad_t - pad_b
+        canvas.delete("all")
+        if title:
+            canvas.create_text(pad_l, 12, text=title, font=("Segoe UI", 9, "bold"), fill="#1e293b", anchor="w")
+        if not data_pairs:
+            canvas.create_text(c_w/2, c_h/2, text="No data", font=("Segoe UI", 9), fill="#94a3b8")
+            return
+        max_val = max([v for k, v in data_pairs] or [1])
+        y_max = max(5, ((max_val // 5) + 1) * 5)
+        for i in range(6):
+            val = int((y_max / 5) * i)
+            y_pos = pad_t + plot_h - (i * (plot_h / 5))
+            canvas.create_line(pad_l, y_pos, pad_l + plot_w, y_pos, fill="#f1f5f9", width=1)
+            canvas.create_text(pad_l - 6, y_pos, text=str(val), fill="#64748b", font=("Segoe UI", 8), anchor="e")
+        canvas.create_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, fill="#cbd5e1", width=1.5)
+        num_bars = len(data_pairs)
+        bar_width = min(48, plot_w / max(1, num_bars * 1.6))
+        for idx, (name, val) in enumerate(data_pairs):
+            bx = pad_l + (idx * (plot_w / num_bars)) + (plot_w / num_bars / 2) - (bar_width / 2)
+            bh = (val / y_max) * plot_h if y_max > 0 else 0
+            by = pad_t + plot_h - bh
+            canvas.create_rectangle(bx, by, bx + bar_width, pad_t + plot_h, fill=bar_color, outline="")
+            canvas.create_text(bx + bar_width/2, by - 7, text=str(val), font=("Segoe UI", 8, "bold"), fill="#334155")
+            canvas.create_text(bx + bar_width/2, pad_t + plot_h + 12, text=name, font=("Segoe UI", 8), fill="#475569", anchor="n")
+
     def render_string_black_dashboard(self):
-        pass
+        if self.mode != "STRING_BLACK": return
+        for w in self.result_container.winfo_children(): w.destroy()
+
+        d_from = self.date_from_val.get('date', datetime.now())
+        date_str = d_from.strftime("%Y%m%d")
+
+        # Load cache if not already loaded for this date
+        if getattr(self, 'current_loaded_cache_date', None) != date_str or not hasattr(self, 'raw_string_black_data') or self.raw_string_black_data is None:
+            cache_file = os.path.join(getattr(config, 'BASE_DIR', '.'), f"StringBlackData_{date_str}.json")
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        loaded = json.load(f)
+                    for item in loaded:
+                        if 'datetime' not in item and 'datetime_str' in item:
+                            try:
+                                item['datetime'] = datetime.strptime(item['datetime_str'], "%Y-%m-%d %H:%M:%S")
+                            except Exception: pass
+                    self.raw_string_black_data = loaded
+                    self.current_loaded_cache_date = date_str
+                except Exception as e:
+                    print(f"[STRING BLACK LOAD ERROR]: {e}")
+                    self.raw_string_black_data = []
+            else:
+                self.raw_string_black_data = []
+
+        # Parse selected filter window
+        slot_text = self.cb_timeslot.get() if hasattr(self, 'cb_timeslot') else "All Shift"
+        time_range = None
+        if "All Shift" not in slot_text and " - " in slot_text:
+            try:
+                p1, p2 = slot_text.split(' - ')
+                sh, sm = map(int, p1.strip().split(':'))
+                eh, em = map(int, p2.strip().split(':'))
+                from datetime import time as dt_time
+                time_range = (dt_time(sh, sm), dt_time(eh, em))
+            except Exception: pass
+
+        # Filter by selected lines & time window
+        selected_stations = self.get_selected_stations()
+        filtered = []
+        for r in (self.raw_string_black_data or []):
+            st = r.get('station', '')
+            if selected_stations and st not in selected_stations:
+                continue
+            dt = r.get('datetime')
+            if dt and time_range:
+                t_val = dt.time()
+                t_start, t_end = time_range
+                if t_start <= t_end:
+                    if not (t_start <= t_val <= t_end): continue
+                else:
+                    if not (t_val >= t_start or t_val <= t_end): continue
+            filtered.append(r)
+
+        self.filtered_string_black_data = filtered
+        total_cnt = len(filtered)
+        self.lbl_summary.config(text=f"Total String Black NG: {total_cnt}")
+
+        if not filtered:
+            card = tk.Frame(self.result_container, bg="white", bd=1, relief=tk.SOLID, padx=25, pady=25)
+            card.pack(fill=tk.X, padx=15, pady=25)
+            tk.Label(card, text=f"No String Black records for {d_from.strftime('%Y-%m-%d')}", font=("Segoe UI", 12, "bold"), bg="white", fg=config.COLOR_PRIMARY).pack(pady=(0, 4))
+            tk.Label(card, text="Filter Window: " + slot_text + f"  •  Active Lines: {len(selected_stations)}", font=("Segoe UI", 9), bg="white", fg=config.COLOR_TEXT_SECONDARY).pack(pady=(0, 12))
+            tk.Label(card, text="💡 Click 'Refresh Cache' above to scan factory station folders for this date,\nor choose a date with existing records (e.g. 2026-08-25).", font=("Segoe UI", 9), bg="white", fg="#475569").pack(pady=(0, 15))
+            ModernButton(card, text="⚡ Scan Final EL Stations Now", command=self.toggle_search, primary=True).pack()
+            self.btn_export.config(state="disabled", text="Export Excel")
+            if hasattr(self, 'btn_export_imgs'):
+                self.btn_export_imgs.config(state="disabled", text="Export Images")
+            return
+
+        # Metrics computation
+        male_cnt = sum(1 for r in filtered if r.get('male'))
+        mid_cnt = sum(1 for r in filtered if r.get('middle'))
+        fem_cnt = sum(1 for r in filtered if r.get('female'))
+        
+        line_counts = {f"Line {i}": 0 for i in range(1, 8)}
+        for r in filtered:
+            st = r.get('station', '')
+            l_name = parse_line_from_station(st) or st
+            if l_name in line_counts:
+                line_counts[l_name] += 1
+
+        # 1. Header Card with KPI Pills
+        kpi_frame = tk.Frame(self.result_container, bg="white", bd=1, relief=tk.SOLID, padx=14, pady=10)
+        kpi_frame.pack(fill=tk.X, padx=6, pady=(6, 10))
+
+        top_info = tk.Frame(kpi_frame, bg="white")
+        top_info.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(top_info, text=f"String Black Analytics: {d_from.strftime('%Y-%m-%d')}", font=("Segoe UI", 12, "bold"), bg="white", fg=config.COLOR_PRIMARY).pack(side=tk.LEFT)
+        tk.Label(top_info, text=f"  •  Window: {slot_text}", font=("Segoe UI", 10, "bold"), bg="white", fg="#64748b").pack(side=tk.LEFT)
+
+        pill_row = tk.Frame(kpi_frame, bg="white")
+        pill_row.pack(fill=tk.X)
+
+        def make_pill(parent, label, count, pct, bg_c, fg_c):
+            f = tk.Frame(parent, bg=bg_c, bd=1, relief=tk.SOLID, padx=8, pady=4)
+            f.pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(f, text=f"{label}: {count} ({pct}%)", font=("Segoe UI", 9, "bold"), bg=bg_c, fg=fg_c).pack()
+
+        make_pill(pill_row, "🚨 Total NG", total_cnt, 100, "#fee2e2", "#991b1b")
+        make_pill(pill_row, "Top Zone (Male)", male_cnt, round(male_cnt/total_cnt*100, 1), "#fef3c7", "#92400e")
+        make_pill(pill_row, "Middle Zone", mid_cnt, round(mid_cnt/total_cnt*100, 1), "#fed7aa", "#9a3412")
+        make_pill(pill_row, "Bot Zone (Female)", fem_cnt, round(fem_cnt/total_cnt*100, 1), "#f3e8ff", "#6b21a8")
+
+        # 2. Charts Section
+        chart_section = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
+        chart_section.pack(fill=tk.X, padx=4, pady=(0, 10))
+
+        # Chart 1: Zone Distribution
+        w_zone = tk.LabelFrame(chart_section, text=" Zone Breakdown (Male / Middle / Female) ", font=config.FONT_BODY_BOLD, bg="white", fg=config.COLOR_PRIMARY, padx=8, pady=8)
+        w_zone.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        c_zone = tk.Canvas(w_zone, width=440, height=200, bg="white", highlightthickness=0)
+        c_zone.pack(fill=tk.BOTH, expand=True)
+        self._draw_sb_bar_chart(c_zone, 440, 200, [("Male (Top)", male_cnt), ("Middle", mid_cnt), ("Female (Bot)", fem_cnt)], bar_color="#e11d48")
+
+        # Chart 2: Line Breakdown
+        w_line = tk.LabelFrame(chart_section, text=" Defect Count by Production Line ", font=config.FONT_BODY_BOLD, bg="white", fg=config.COLOR_PRIMARY, padx=8, pady=8)
+        w_line.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        c_line = tk.Canvas(w_line, width=540, height=200, bg="white", highlightthickness=0)
+        c_line.pack(fill=tk.BOTH, expand=True)
+        self._draw_sb_bar_chart(c_line, 540, 200, list(line_counts.items()), bar_color="#1a5b82")
+
+        # 3. Defect Cards Gallery
+        gallery_header = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
+        gallery_header.pack(fill=tk.X, padx=6, pady=(4, 4))
+        tk.Label(gallery_header, text=f"DETECTED STRING BLACK DEFECTS ({total_cnt})", font=("Segoe UI", 10, "bold"), bg=config.COLOR_BG_MAIN, fg="#475569").pack(side=tk.LEFT)
+
+        grid = tk.Frame(self.result_container, bg=config.COLOR_BG_MAIN)
+        grid.pack(fill=tk.X, padx=4, pady=(0, 10))
+
+        for idx, item in enumerate(filtered):
+            r = idx // 3
+            c = idx % 3
+            card = StringBlackCard(grid, item, self.app.open_original_image)
+            card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+
+        for c_idx in range(min(3, max(1, len(filtered)))):
+            grid.grid_columnconfigure(c_idx, weight=1, uniform="sb_card_col")
+
+        self.btn_export.config(state="normal", text=f"Export Excel ({total_cnt})")
+        if hasattr(self, 'btn_export_imgs'):
+            self.btn_export_imgs.config(state="normal", text=f"Export Images ({total_cnt})")
+        self.results_canvas.config(scrollregion=self.results_canvas.bbox("all"))
 
     def export_excel(self):
+        if self.mode == "STRING_BLACK":
+            records_to_export = getattr(self, 'filtered_string_black_data', [])
+            if not records_to_export:
+                messagebox.showwarning("Export Excel", "No String Black records available to export!")
+                return
+            d_val = self.date_from_val.get('date', datetime.now())
+            default_name = f"String_Black_Analytics_{d_val.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M%S')}.xlsx"
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                initialfile=default_name,
+                filetypes=[("Excel Files", "*.xlsx")],
+                title="Export String Black Analytics to Excel"
+            )
+            if not filename: return
+            try:
+                import openpyxl
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "String Black Defects"
+                headers = ["Date", "Time", "Serial No", "Line", "Station", "Dark %", "Male (Top)", "Middle", "Female (Bot)", "Status", "Image Path"]
+                ws.append(headers)
+                ws.row_dimensions[1].height = 26
+
+                header_fill = PatternFill(start_color="1A5B82", end_color="1A5B82", fill_type="solid")
+                header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+                for col_idx in range(1, len(headers) + 1):
+                    c = ws.cell(row=1, column=col_idx)
+                    c.fill = header_fill
+                    c.font = header_font
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+
+                for r_idx, item in enumerate(records_to_export, start=2):
+                    dt = item.get('datetime')
+                    d_str = dt.strftime("%Y-%m-%d") if isinstance(dt, datetime) else str(item.get('datetime_str', ''))[:10]
+                    t_str = dt.strftime("%H:%M:%S") if isinstance(dt, datetime) else str(item.get('datetime_str', ''))[11:]
+                    sn_val = item.get('sn', '')
+                    st_val = item.get('station', '')
+                    line_val = parse_line_from_station(st_val) or st_val
+                    dark_pct = item.get('dark_pct', 0.0)
+                    m_val = "NG" if item.get('male') else "OK"
+                    mid_val = "NG" if item.get('middle') else "OK"
+                    f_val = "NG" if item.get('female') else "OK"
+                    st_status = item.get('status', 'NG')
+                    path_val = item.get('path', '')
+
+                    ws.append([d_str, t_str, sn_val, line_val, st_val, dark_pct, m_val, mid_val, f_val, st_status, path_val])
+
+                for col in ws.columns:
+                    max_len = max(len(str(cell.value or '')) for cell in col)
+                    col_letter = col[0].column_letter
+                    ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+                wb.save(filename)
+                resp = messagebox.askyesno("Export Complete", f"Exported {len(records_to_export)} String Black records to:\n{filename}\n\nOpen Excel file now?")
+                if resp: os.startfile(filename)
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export Excel:\n{e}")
+            return
+
         if not self.current_results or not any(self.current_results.values()):
             messagebox.showwarning("Export Excel", "No search results available to export!")
             return
@@ -3671,6 +3973,37 @@ class TabContent(tk.Frame):
             messagebox.showerror("Export Error", f"Failed to export Excel report:\n{e}")
 
     def export_images_to_folder(self):
+        if self.mode == "STRING_BLACK":
+            records_to_export = getattr(self, 'filtered_string_black_data', [])
+            if not records_to_export:
+                messagebox.showwarning("Export Images", "No String Black images available to export!")
+                return
+            dest_folder = filedialog.askdirectory(title="Select Destination Folder for Exported Images")
+            if not dest_folder: return
+            try:
+                import shutil
+                copied_count = 0
+                for item in records_to_export:
+                    src_path = item.get('path')
+                    if src_path and os.path.exists(src_path):
+                        sn = item.get('sn', 'UNKNOWN')
+                        fname = os.path.basename(src_path)
+                        dst_name = f"{sn}_{fname}" if sn not in fname else fname
+                        dst_path = os.path.join(dest_folder, dst_name)
+                        if os.path.exists(dst_path):
+                            base, ext = os.path.splitext(dst_name)
+                            dst_path = os.path.join(dest_folder, f"{base}_{copied_count+1}{ext}")
+                        shutil.copy2(src_path, dst_path)
+                        copied_count += 1
+                if copied_count > 0:
+                    resp = messagebox.askyesno("Export Complete", f"Successfully copied {copied_count} images to:\n{dest_folder}\n\nOpen destination folder now?")
+                    if resp: os.startfile(dest_folder)
+                else:
+                    messagebox.showinfo("Export", "No image files found to copy (check network connection).")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export images:\n{e}")
+            return
+
         if not self.current_results or not any(self.current_results.values()):
             messagebox.showwarning("Export Images", "No search results available to export!")
             return
@@ -4013,6 +4346,33 @@ class AOIDashboardApp:
         self.sidebar_nav_canvas.config(scrollregion=self.sidebar_nav_canvas.bbox("all"))
 
     def start_search_for_tab(self, tab):
+        if tab.mode == "STRING_BLACK":
+            selected_stations = tab.get_selected_stations()
+            if not selected_stations:
+                messagebox.showwarning("Selection", "Please select at least one active Line!")
+                return
+            d_start = tab.date_from_val.get('date', datetime.now()).replace(hour=0, minute=0, second=0)
+            d_end = tab.date_to_val.get('date', datetime.now()).replace(hour=23, minute=59, second=59)
+
+            for w in tab.result_container.winfo_children(): w.destroy()
+            tab.results_canvas.yview_moveto(0)
+            tab.lbl_summary.config(text="Scanning Final EL NG directories...")
+            tab.btn_export.config(state="disabled")
+            if hasattr(tab, 'btn_export_imgs'):
+                tab.btn_export_imgs.config(state="disabled")
+            tab.progress_bar = ttk.Progressbar(tab.result_container, mode='indeterminate', length=350)
+            tab.progress_bar.pack(pady=(40, 10))
+            tab.progress_bar.start(15)
+
+            self.is_searching = True
+            self.active_tab = tab
+            self.search_id += 1
+            current_sid = self.search_id
+            tab.btn_go.config(text="Stop", bg=config.COLOR_STATUS_NG)
+            self.search_engine.cancel_flag.clear()
+            threading.Thread(target=self._run_string_black_search, args=(tab, d_start, d_end, selected_stations, current_sid), daemon=True).start()
+            return
+
         sn_list = [line.strip() for line in tab.txt_sn.get("1.0", tk.END).strip().split('\n') if line.strip()] if hasattr(tab, 'txt_sn') else []
         if not sn_list:
             messagebox.showwarning("Search", "Please enter at least one Serial Number!")
@@ -4047,10 +4407,15 @@ class AOIDashboardApp:
             self.is_searching = False
             self.search_id += 1
             try:
-                self.active_tab.btn_go.config(text="Search", state="normal", bg=config.COLOR_PRIMARY)
+                btn_txt = "Refresh Cache" if self.active_tab.mode == "STRING_BLACK" else "Search"
+                self.active_tab.btn_go.config(text=btn_txt, state="normal", bg=config.COLOR_PRIMARY)
                 self.active_tab.lbl_summary.config(text="Cancelled")
                 for w in self.active_tab.result_container.winfo_children():
-                    if isinstance(w, ttk.Progressbar): w.destroy()
+                    if isinstance(w, ttk.Progressbar):
+                        try:
+                            w.stop()
+                            w.destroy()
+                        except Exception: pass
             except Exception: pass
 
     def _update_overall_progress(self, tab, curr_sn_idx, total_sns, current_sn):
@@ -4061,6 +4426,52 @@ class AOIDashboardApp:
             if hasattr(tab, 'lbl_summary'):
                 tab.lbl_summary.config(text=f"Searching SN {curr_sn_idx}/{total_sns}: {current_sn}")
         except Exception: pass
+
+    def _run_string_black_search(self, tab, start, end, stations_list, search_id):
+        if search_id != self.search_id: return
+        res, _ = self.search_engine.search_final_el(
+            serial_number="",
+            stations_list=stations_list,
+            start_date=start,
+            end_date=end,
+            time_filter=None,
+            require_string_black=True,
+            max_results=3000
+        )
+        if self.search_engine.cancel_flag.is_set() or search_id != self.search_id:
+            return
+
+        date_str = start.strftime("%Y%m%d")
+        cache_file = os.path.join(getattr(config, 'BASE_DIR', '.'), f"StringBlackData_{date_str}.json")
+        try:
+            serializable = []
+            for item in res:
+                c = dict(item)
+                if isinstance(c.get('datetime'), datetime):
+                    c['datetime_str'] = c['datetime'].strftime("%Y-%m-%d %H:%M:%S")
+                    del c['datetime']
+                serializable.append(c)
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(serializable, f, indent=2)
+            print(f"[STRING BLACK CACHE]: Saved {len(serializable)} records to {cache_file}")
+        except Exception as e:
+            print(f"[STRING BLACK CACHE ERROR]: {e}")
+
+        self.root.after(0, lambda: self._display_string_black_results(tab, res, search_id, date_str))
+
+    def _display_string_black_results(self, tab, results, search_id, date_str):
+        if search_id != self.search_id: return
+        self.is_searching = False
+        tab.btn_go.config(state="normal", text="Refresh Cache", bg=config.COLOR_PRIMARY)
+        for w in tab.result_container.winfo_children():
+            if isinstance(w, ttk.Progressbar):
+                try:
+                    w.stop()
+                    w.destroy()
+                except Exception: pass
+        tab.raw_string_black_data = results
+        tab.current_loaded_cache_date = date_str
+        tab.render_string_black_dashboard()
 
     def _run_search(self, tab, sn_list, start, end, stations_list, search_id):
         if search_id != self.search_id: return

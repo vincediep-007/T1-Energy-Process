@@ -30,6 +30,8 @@ server.pfx
 # Diagnostics and runtime floor logs
 last_mes_response.html
 mes_process_trend.json
+mes_process_trend_log.json
+StringBlackData_*.json
 
 # OS and IDE files
 .DS_Store

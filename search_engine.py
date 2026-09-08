@@ -220,25 +220,45 @@ class ImageSearchEngine:
         except: pass
         return results
 
+    def get_final_el_date_folders(self, start_date: datetime, end_date: datetime) -> List[str]:
+        folders = set()
+        delta = (end_date - start_date).days
+        for i in range(delta + 1):
+            d = start_date + timedelta(days=i)
+            y = d.year
+            m = d.month
+            day = d.day
+            # 1. Unpadded: e.g. 2026 Year\8 Month\25 Day or 2026 Year\9 Month\7 Day
+            folders.add(os.path.join(f"{y} Year", f"{m} Month", f"{day} Day"))
+            # 2. Fully zero-padded: e.g. 2026 Year\08 Month\25 Day or 2026 Year\09 Month\07 Day
+            folders.add(os.path.join(f"{y} Year", f"{m:02d} Month", f"{day:02d} Day"))
+            # 3. Padded month, unpadded day: e.g. 2026 Year\09 Month\7 Day
+            folders.add(os.path.join(f"{y} Year", f"{m:02d} Month", f"{day} Day"))
+            # 4. Unpadded month, padded day: e.g. 2026 Year\9 Month\07 Day
+            folders.add(os.path.join(f"{y} Year", f"{m} Month", f"{day:02d} Day"))
+            # Month transition check (e.g. at end of month)
+            if (d + timedelta(days=1)).day == 1:
+                nm = 1 if m == 12 else m + 1
+                ny = y + 1 if m == 12 else y
+                folders.add(os.path.join(f"{ny} Year", f"{nm} Month", f"{day} Day"))
+                folders.add(os.path.join(f"{ny} Year", f"{nm:02d} Month", f"{day:02d} Day"))
+        return list(folders)
+
     def search_final_el(self, serial_number: str, stations_list: List[str],
                         start_date: datetime, end_date: datetime, 
                         time_filter: Tuple[datetime, datetime] = None,
                         require_string_black: bool = False,
                         max_results: int = 800) -> Tuple[List[Dict], bool]:
         self.cancel_flag.clear()
-        delta = (end_date - start_date).days
+        date_folders = self.get_final_el_date_folders(start_date, end_date)
         search_paths = []
 
         for station in stations_list:
             station_root = config.FINAL_EL_MAP.get(station)
             if not station_root: continue
             
-            for i in range(delta + 1):
-                d = start_date + timedelta(days=i)
-                y_str = f"{d.year} Year"
-                m_str = f"{d.month} Month"
-                d_str = f"{d.day} Day"
-                day_path = os.path.join(station_root, y_str, m_str, d_str)
+            for df in date_folders:
+                day_path = os.path.join(station_root, df)
                 search_paths.append((day_path, station))
 
         worker = lambda p, sn, st: self.search_final_el_path(p, sn, st, time_filter, require_string_black)
@@ -278,7 +298,16 @@ class ImageSearchEngine:
                     self._report_progress(completed, total_paths, f"{tag}... {pct}%")
                 except: pass
 
-        return all_results, exceeded_limit
+        # Deduplicate results by normalized file path
+        unique_results = []
+        seen_paths = set()
+        for r in all_results:
+            p = r.get('path', '').upper()
+            if p and p not in seen_paths:
+                seen_paths.add(p)
+                unique_results.append(r)
+
+        return unique_results, exceeded_limit
 
     def group_by_timestamp(self, images: List[Dict]) -> Dict[str, List[Dict]]:
         if not images: return {}
