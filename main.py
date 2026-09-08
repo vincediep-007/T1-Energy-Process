@@ -916,6 +916,8 @@ class MESProcessLogTab(tk.Frame):
         ModernButton(btn_box, text="🇨🇳 Chinese Guide", command=self.open_chinese_guide, primary=False).pack(side=tk.LEFT, padx=3)
         ModernButton(btn_box, text="📁 MES Photos", command=self.open_mes_photos_folder, primary=False).pack(side=tk.LEFT, padx=3)
         ModernButton(btn_box, text="🔄 Refresh Log", command=self.refresh_log, primary=False).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="🔄 New Shift Reset", command=lambda: self.reset_for_new_shift(get_operational_shift_info()), primary=False).pack(side=tk.LEFT, padx=3)
+        ModernButton(btn_box, text="📦 View Archive", command=self.open_archive_log, primary=False).pack(side=tk.LEFT, padx=3)
         ModernButton(btn_box, text="📥 Export CSV", command=self.export_csv, primary=True).pack(side=tk.LEFT, padx=3)
         ModernButton(btn_box, text="🗑️ Clear Log", command=self.clear_log, primary=False).pack(side=tk.LEFT, padx=3)
 
@@ -1097,15 +1099,58 @@ class MESProcessLogTab(tk.Frame):
         self.ent_filter.delete(0, tk.END)
         self.apply_filter()
 
+    def open_archive_log(self):
+        archive_file = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend_archive.json")
+        if not os.path.exists(archive_file):
+            messagebox.showinfo("MES Archive", "No archived MES records found yet.")
+            return
+        try:
+            os.startfile(archive_file)
+        except Exception:
+            try:
+                subprocess.Popen(["notepad.exe", archive_file])
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open archive file:\n{e}")
+
     def reset_for_new_shift(self, shift_info=None):
         if hasattr(self, 'ent_query_sn'):
             self.ent_query_sn.delete(0, tk.END)
         if hasattr(self, 'ent_filter'):
             self.ent_filter.delete(0, tk.END)
+
+        # Archive records from previous shift so active workspace starts clean
+        if self.records:
+            try:
+                archive_file = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend_archive.json")
+                archived = []
+                if os.path.exists(archive_file):
+                    try:
+                        with open(archive_file, 'r', encoding='utf-8') as af:
+                            archived = json.load(af)
+                    except Exception:
+                        archived = []
+                existing_sns = {r.get('sn') for r in archived if r.get('sn')}
+                for r in self.records:
+                    if r.get('sn') and r.get('sn') not in existing_sns:
+                        archived.append(r)
+                with open(archive_file, 'w', encoding='utf-8') as af:
+                    json.dump(archived, af, ensure_ascii=False, indent=2, default=str)
+            except Exception as e:
+                print(f"[MES ARCHIVE ERROR]: {e}")
+
+        # Clear active trend log for the fresh shift
+        try:
+            with open(MES_TREND_FILE, 'w', encoding='utf-8') as f:
+                json.dump([], f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        self.records = []
         self.apply_filter()
+        self.update_kpi_cards()
         shift_label = shift_info.get('name', 'New Shift') if shift_info else 'New Shift'
         if hasattr(self, 'lbl_query_status'):
-            self.lbl_query_status.config(text=f"Shift Rollover: {shift_label}", fg="#2563eb")
+            self.lbl_query_status.config(text=f"Shift Reset: {shift_label} (Log archived & refreshed)", fg="#059669")
 
     def apply_filter(self):
         query = self.ent_filter.get().strip().lower()
@@ -2073,6 +2118,8 @@ class ModuleReviewTab(tk.Frame):
         ModernButton(act_row, text="Export Styled Defect Excel File", command=self.export_styled_excel, primary=False).pack(side=tk.LEFT, padx=(0, 6))
         ModernButton(act_row, text="Open Voice Samples Folder", command=self.open_voice_samples_folder, primary=False).pack(side=tk.LEFT, padx=(0, 6))
         ModernButton(act_row, text="📐 Reset Col Widths", command=self.reset_column_widths, primary=False).pack(side=tk.LEFT, padx=(0, 6))
+        ModernButton(act_row, text="🔄 New Shift Reset", command=self.manual_shift_reset, primary=False).pack(side=tk.LEFT, padx=(0, 6))
+        ModernButton(act_row, text="📦 View Archive", command=self.open_archive_history, primary=False).pack(side=tk.LEFT, padx=(0, 6))
         ModernButton(act_row, text="Clear Records", command=self.clear_all_records, primary=False).pack(side=tk.LEFT)
 
         self.lbl_table_count = tk.Label(act_row, text="Total Records Reviewed: 0", font=config.FONT_BODY_BOLD, bg=config.COLOR_BG_MAIN, fg=config.COLOR_PRIMARY)
@@ -2926,7 +2973,19 @@ class ModuleReviewTab(tk.Frame):
                 elif not target_rec.get('shift'):
                     target_rec['shift'] = ""
                 target_rec['pre_el_views'] = views
-                self.app.incoming_event_queue.put(('REFRESH', {}))
+
+                def _update_ui():
+                    try:
+                        self.refresh_treeview()
+                        rec_id = target_rec.get('id')
+                        is_active = (self.selected_rec_id == rec_id) or (not self.selected_rec_id and self.records and self.records[0].get('id') == rec_id)
+                        if is_active and ln and hasattr(self, 'cb_line'):
+                            self.cb_line.set(ln)
+                    except Exception as ex:
+                        print(f"[PRE-EL UI UPDATE ERROR]: {ex}")
+
+                self.after(0, _update_ui)
+                self.app.incoming_event_queue.put(('REFRESH', {'rec_id': target_rec.get('id'), 'line': ln, 'shift': sh}))
             except Exception as e:
                 print(f"[PRE-EL QUERY ERROR]: {e}")
 
@@ -2997,6 +3056,7 @@ class ModuleReviewTab(tk.Frame):
                 self.register_photo_alias(target_rec['id'], old_p, renamed_def)
             target_rec['date'] = file_dt.strftime("%m/%d/%Y")
             target_rec['eval_shift'] = eval_shift
+            self.selected_rec_id = target_rec.get('id')
             self.refresh_treeview()
 
             # Asynchronously query Pre-EL machine station to prevent GUI lag
@@ -3040,6 +3100,7 @@ class ModuleReviewTab(tk.Frame):
         if self.cb_class.get(): target_rec['class'] = self.cb_class.get()
         if self.cb_result.get(): target_rec['result'] = self.cb_result.get()
         if self.cb_cause.get(): target_rec['cause'] = self.cb_cause.get()
+        self.selected_rec_id = target_rec.get('id')
         self.refresh_treeview()
 
         self.query_pre_el_async(target_rec, sn, now_dt)
@@ -3052,7 +3113,6 @@ class ModuleReviewTab(tk.Frame):
         self.cb_cause.set("")
         self.ent_sn.focus_set()
 
-
     def clear_all_records(self):
         if messagebox.askyesno("Clear", "Clear all records?"):
             self.records.clear()
@@ -3060,7 +3120,45 @@ class ModuleReviewTab(tk.Frame):
             for w in self.rows_frame.winfo_children(): w.destroy()
             self.lbl_table_count.config(text="Total Records Reviewed: 0")
 
+    def manual_shift_reset(self):
+        if messagebox.askyesno("New Shift Reset", "Start a new operational shift?\n\nThis will safely archive current review records to history and reset the workspace with a clean table."):
+            shift_info = get_operational_shift_info(datetime.now())
+            self.reset_for_new_shift(shift_info)
+            messagebox.showinfo("New Shift Reset", f"Workspace reset for {shift_info.get('name', 'New Shift')}.\nPrevious records archived safely.")
+
+    def open_archive_history(self):
+        archive_file = os.path.join(config.LOCAL_DATA_DIR, "module_review_history_archive.json")
+        if not os.path.exists(archive_file):
+            messagebox.showinfo("Archive Empty", "No archived Module Review records found yet.")
+            return
+        try:
+            os.startfile(archive_file)
+        except Exception:
+            try:
+                import subprocess
+                subprocess.Popen(["notepad.exe", archive_file])
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open archive file: {e}")
+
     def reset_for_new_shift(self, shift_info=None):
+        if self.records:
+            try:
+                archive_file = os.path.join(config.LOCAL_DATA_DIR, "module_review_history_archive.json")
+                existing_archive = []
+                if os.path.exists(archive_file):
+                    try:
+                        with open(archive_file, 'r', encoding='utf-8') as f:
+                            existing_archive = json.load(f)
+                    except Exception:
+                        existing_archive = []
+                clean_recs = [{k: v for k, v in r.items() if not str(k).startswith('_')} for r in self.records]
+                existing_archive.extend(clean_recs)
+                with open(archive_file, 'w', encoding='utf-8') as f:
+                    json.dump(existing_archive, f, ensure_ascii=False, indent=2, default=str)
+                print(f"[MR SHIFT RESET]: Archived {len(clean_recs)} records to {archive_file}")
+            except Exception as e:
+                print(f"[MR SHIFT ARCHIVE ERROR]: {e}")
+
         if hasattr(self, 'ent_sn'):
             self.ent_sn.delete(0, tk.END)
         if hasattr(self, 'cb_class'):
@@ -4280,6 +4378,7 @@ class AOIDashboardApp:
                     tab.lbl_server_url.config(text=self.phone_server_url)
                 if hasattr(tab, 'update_qr_code'):
                     tab.update_qr_code(self.phone_server_url)
+        self.check_initial_shift_state()
         self.check_shift_and_day_rollover()
         self._poll_incoming_events()
 
@@ -4331,6 +4430,16 @@ class AOIDashboardApp:
                                 data.get('file_dt')
                             )
                             break
+                elif evt_type == 'REFRESH':
+                    for tab in self.all_tabs:
+                        if isinstance(tab, ModuleReviewTab):
+                            tab.refresh_treeview()
+                            rec_id = data.get('rec_id') if isinstance(data, dict) else None
+                            line_val = data.get('line') if isinstance(data, dict) else None
+                            if line_val and hasattr(tab, 'cb_line'):
+                                if tab.selected_rec_id == rec_id or not tab.selected_rec_id:
+                                    tab.cb_line.set(line_val)
+                            break
         except Exception as e:
             print(f"[EVENT POLL ERROR]: {e}")
         finally:
@@ -4338,6 +4447,47 @@ class AOIDashboardApp:
                 self.root.after(50, self._poll_incoming_events)
             except Exception:
                 pass
+
+    def check_initial_shift_state(self):
+        shift_state_file = os.path.join(config.LOCAL_DATA_DIR, "shift_state.json")
+        last_shift_key = None
+        if os.path.exists(shift_state_file):
+            try:
+                with open(shift_state_file, 'r', encoding='utf-8') as f:
+                    last_shift_key = json.load(f).get('shift_key')
+            except Exception:
+                pass
+
+        current_key_str = f"{self.current_shift_info['date']}_{'DAY' if self.current_shift_info['is_day'] else 'NIGHT'}"
+
+        needs_reset = False
+        if last_shift_key and last_shift_key != current_key_str:
+            print(f"[STARTUP SHIFT DETECTED]: Last recorded shift was '{last_shift_key}'. Current shift is '{current_key_str}'. Performing shift rollover reset and archiving...")
+            needs_reset = True
+        else:
+            # Check if active MES trend log has older records from a previous date
+            mes_trend_file = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend.json")
+            if os.path.exists(mes_trend_file):
+                try:
+                    with open(mes_trend_file, 'r', encoding='utf-8') as f:
+                        records = json.load(f)
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    has_old_records = any(str(r.get('timestamp', ''))[:10] < today_str for r in records if r.get('timestamp'))
+                    if has_old_records:
+                        print(f"[STARTUP CHECK]: Found older shift records in active log. Archiving and resetting for fresh shift.")
+                        needs_reset = True
+                except Exception:
+                    pass
+
+        if needs_reset:
+            self.on_operational_shift_changed(self.current_shift_info)
+
+        # Record current shift key
+        try:
+            with open(shift_state_file, 'w', encoding='utf-8') as f:
+                json.dump({'shift_key': current_key_str, 'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+        except Exception as e:
+            print(f"[SHIFT STATE SAVE ERROR]: {e}")
 
     def get_current_tab(self):
         try:
@@ -4365,7 +4515,14 @@ class AOIDashboardApp:
             prev_shift = self.current_shift_info.get('name', 'Previous Shift')
             self.current_shift_info = shift_info
             self.current_shift_key = shift_key
-            print(f"[APP SHIFT ROLLOVER]: Operational shift changed from {prev_shift} to {shift_info['name']} (Key: {shift_key}). Resetting scanning & workspaces across all tabs...")
+            current_key_str = f"{shift_info['date']}_{'DAY' if shift_info['is_day'] else 'NIGHT'}"
+            print(f"[APP SHIFT ROLLOVER]: Operational shift changed from {prev_shift} to {shift_info['name']} (Key: {current_key_str}). Resetting scanning & workspaces across all tabs...")
+            shift_state_file = os.path.join(config.LOCAL_DATA_DIR, "shift_state.json")
+            try:
+                with open(shift_state_file, 'w', encoding='utf-8') as f:
+                    json.dump({'shift_key': current_key_str, 'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+            except Exception:
+                pass
             self.on_operational_shift_changed(shift_info)
 
         # Check every 15 seconds
