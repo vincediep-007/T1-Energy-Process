@@ -611,7 +611,7 @@ def save_pre_el_search_history(sn_list: List[str], all_results: Dict):
 
         data = data[:500]
         with open(config.PRE_EL_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
     except Exception as e:
         print(f"[PRE-EL HISTORY SAVE ERROR]: {e}")
 
@@ -627,7 +627,7 @@ def save_module_review_history(records: List[Dict]):
             c = {k: v for k, v in r.items() if not str(k).startswith('_')}
             clean_records.append(c)
         with open(config.MR_RECORDS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(clean_records, f, ensure_ascii=False, indent=2)
+            json.dump(clean_records, f, ensure_ascii=False, indent=2, default=str)
     except Exception as e:
         print(f"[MR HISTORY SAVE ERROR]: {e}")
 
