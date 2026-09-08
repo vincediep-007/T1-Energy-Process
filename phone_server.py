@@ -657,6 +657,109 @@ MES_IN_FLIGHT_LOCK = threading.Lock()
 MES_IN_FLIGHT_EVENTS = {}
 MES_IN_FLIGHT_RESULTS = {}
 
+MES_SESSION_LOCK = threading.Lock()
+MES_CACHED_SESSION = {
+    "opener": None,
+    "cookie_parts": [],
+    "access_token": "",
+    "timestamp": 0
+}
+
+def invalidate_mes_session():
+    with MES_SESSION_LOCK:
+        MES_CACHED_SESSION["opener"] = None
+        MES_CACHED_SESSION["cookie_parts"] = []
+        MES_CACHED_SESSION["access_token"] = ""
+        MES_CACHED_SESSION["timestamp"] = 0
+
+def get_or_create_mes_session(base_url="http://10.200.3.109:8080", force_fresh=False):
+    """
+    Returns (opener, cookie_parts, access_token, reused_bool).
+    Reuses existing authenticated HTTP session if < 1800s old to eliminate 2-4s login latency per query.
+    """
+    global MES_CACHED_SESSION
+    with MES_SESSION_LOCK:
+        now = time.time()
+        if (not force_fresh and 
+            MES_CACHED_SESSION["opener"] is not None and 
+            (now - MES_CACHED_SESSION["timestamp"]) < 1800):
+            return MES_CACHED_SESSION["opener"], list(MES_CACHED_SESSION["cookie_parts"]), MES_CACHED_SESSION["access_token"], True
+
+        import http.cookiejar
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+        auth_headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*"
+        }
+
+        access_token = ""
+        login_success = False
+        login_endpoints = [
+            f"{base_url}/webroot/decision/login",
+            f"{base_url}/webroot/decision/login/valid",
+            f"{base_url}/webroot/decision/login/v10"
+        ]
+        login_payload = json.dumps({"username": "030888", "password": "030888", "validity": -2}).encode('utf-8')
+
+        for ep in login_endpoints:
+            try:
+                req = urllib.request.Request(ep, data=login_payload, headers=auth_headers)
+                with opener.open(req, timeout=3.5) as resp:
+                    resp_body = resp.read().decode('utf-8', errors='ignore')
+                    try:
+                        resp_json = json.loads(resp_body)
+                        if isinstance(resp_json, dict):
+                            data_obj = resp_json.get('data') or {}
+                            access_token = data_obj.get('accessToken') or resp_json.get('accessToken', '')
+                            login_success = True
+                            print(f"[MES LOGIN]: Success at {ep} (token: {bool(access_token)})")
+                            break
+                    except Exception:
+                        if getattr(resp, 'status', 200) in (200, 204):
+                            login_success = True
+                            print(f"[MES LOGIN]: Success at {ep}")
+                            break
+            except Exception as ep_err:
+                print(f"[MES LOGIN PROBE {ep}]: {ep_err}")
+
+        # Cross-Domain SSO Endpoint Probe
+        try:
+            cross_url = safe_ascii_url(f"{base_url}/webroot/decision/login/cross/domain?fine_username=030888&fine_password=030888&validity=-2")
+            cross_req = urllib.request.Request(cross_url, headers={"User-Agent": auth_headers["User-Agent"]})
+            with opener.open(cross_req, timeout=3.0) as cr_resp:
+                pass
+        except Exception:
+            pass
+
+        # Fallback to form URL encoded if JSON login didn't return success
+        if not login_success:
+            try:
+                login_url = f"{base_url}/webroot/decision/login"
+                form_payload = urllib.parse.urlencode({"username": "030888", "password": "030888"}).encode('utf-8')
+                form_headers = dict(auth_headers)
+                form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                form_req = urllib.request.Request(login_url, data=form_payload, headers=form_headers)
+                with opener.open(form_req, timeout=3.0) as f_resp:
+                    pass
+            except Exception as form_err:
+                print(f"[MES LOGIN FORM]: {form_err}")
+
+        cookie_parts = []
+        if access_token:
+            cookie_parts.append(f"fine_auth_token={access_token}")
+        for c in cj:
+            cookie_parts.append(f"{c.name}={c.value}")
+
+        MES_CACHED_SESSION["opener"] = opener
+        MES_CACHED_SESSION["cookie_parts"] = cookie_parts
+        MES_CACHED_SESSION["access_token"] = access_token
+        MES_CACHED_SESSION["timestamp"] = now
+
+        return opener, cookie_parts, access_token, False
+
 
 def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
     """
@@ -742,6 +845,7 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
 
     return_val = None
     try:
+        t_query_start = time.time()
         base_url = "http://10.200.3.109:8080"
         login_url = f"{base_url}/webroot/decision/login"
         enc_sn = urllib.parse.quote(clean_sn)
@@ -785,74 +889,10 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             }
             return return_val
 
-        # 2. Host PC is connected to factory LAN: perform automated login & query
-        import http.cookiejar
-        cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-
-        auth_headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/plain, */*"
-        }
-
-        # Step A: Automated Login with username 030888, password 030888
-        access_token = ""
-        login_success = False
-        login_endpoints = [
-            f"{base_url}/webroot/decision/login",
-            f"{base_url}/webroot/decision/login/valid",
-            f"{base_url}/webroot/decision/login/v10"
-        ]
-        login_payload = json.dumps({"username": "030888", "password": "030888", "validity": -2}).encode('utf-8')
-
-        for ep in login_endpoints:
-            try:
-                req = urllib.request.Request(ep, data=login_payload, headers=auth_headers)
-                with opener.open(req, timeout=3.5) as resp:
-                    resp_body = resp.read().decode('utf-8', errors='ignore')
-                    try:
-                        resp_json = json.loads(resp_body)
-                        if isinstance(resp_json, dict):
-                            data_obj = resp_json.get('data') or {}
-                            access_token = data_obj.get('accessToken') or resp_json.get('accessToken', '')
-                            login_success = True
-                            print(f"[MES LOGIN]: Success at {ep} (token: {bool(access_token)})")
-                            break
-                    except Exception:
-                        if getattr(resp, 'status', 200) in (200, 204):
-                            login_success = True
-                            print(f"[MES LOGIN]: Success at {ep}")
-                            break
-            except Exception as ep_err:
-                print(f"[MES LOGIN PROBE {ep}]: {ep_err}")
-
-        # Cross-Domain SSO Endpoint Probe
-        try:
-            cross_url = safe_ascii_url(f"{base_url}/webroot/decision/login/cross/domain?fine_username=030888&fine_password=030888&validity=-2")
-            cross_req = urllib.request.Request(cross_url, headers={"User-Agent": auth_headers["User-Agent"]})
-            with opener.open(cross_req, timeout=3.0) as cr_resp:
-                pass
-        except Exception:
-            pass
-
-        # Fallback to form URL encoded if JSON login didn't return success
-        if not login_success:
-            try:
-                form_payload = urllib.parse.urlencode({"username": "030888", "password": "030888"}).encode('utf-8')
-                form_headers = dict(auth_headers)
-                form_headers["Content-Type"] = "application/x-www-form-urlencoded"
-                form_req = urllib.request.Request(login_url, data=form_payload, headers=form_headers)
-                with opener.open(form_req, timeout=3.0) as f_resp:
-                    pass
-            except Exception as form_err:
-                print(f"[MES LOGIN FORM]: {form_err}")
-
-        cookie_parts = []
-        if access_token:
-            cookie_parts.append(f"fine_auth_token={access_token}")
-        for c in cj:
-            cookie_parts.append(f"{c.name}={c.value}")
+        # 2. Host PC is connected to factory LAN: obtain cached or fresh authenticated session
+        opener, cookie_parts, access_token, session_reused = get_or_create_mes_session(base_url)
+        if session_reused:
+            print(f"[MES SESSION]: Reusing active session (age: {int(time.time() - MES_CACHED_SESSION['timestamp'])}s)")
 
         query_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -931,6 +971,8 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
                 "appearance_grade": grade,
                 "raw_found": True
             }
+            t_mes_elapsed = time.time() - t_query_start
+            print(f"[MES TIMING]: SN='{clean_sn}' fast-path query finished in {t_mes_elapsed:.3f}s (Session: {'Reused' if session_reused else 'Fresh Login'})")
             return return_val
 
         # Step B2: Deep Probe Directory Entry & Sessions if fast path missed
@@ -1098,6 +1140,8 @@ def query_mes_process_log(sn: str, record_to_trend: bool = True) -> dict:
             "appearance_grade": grade,
             "raw_found": found_any
         }
+        t_mes_elapsed = time.time() - t_query_start
+        print(f"[MES TIMING]: SN='{clean_sn}' full query finished in {t_mes_elapsed:.3f}s (Session: {'Reused' if session_reused else 'Fresh Login'})")
         return return_val
     except Exception as err:
         print(f"[MES QUERY ERROR]: {err}")

@@ -30,6 +30,101 @@ else:
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+MAX_RUNTIME_LOG_BYTES = 10 * 1024 * 1024  # 10 MB limit before rotation
+RUNTIME_LOG_FILE = os.path.join(current_dir, "app_runtime.log")
+
+class DualTerminalLogger:
+    def __init__(self, filepath, original_stream, stream_name="STDOUT"):
+        self.filepath = filepath
+        self.original_stream = original_stream
+        self.stream_name = stream_name
+        self.lock = threading.Lock()
+        self._at_start_of_line = True
+
+    def write(self, message):
+        if not message:
+            return
+        try:
+            if self.original_stream:
+                try:
+                    self.original_stream.write(message)
+                    self.original_stream.flush()
+                except UnicodeEncodeError:
+                    safe_msg = message.encode(getattr(self.original_stream, 'encoding', 'ascii') or 'ascii', errors='replace').decode('ascii')
+                    self.original_stream.write(safe_msg)
+                    self.original_stream.flush()
+        except Exception:
+            pass
+
+        try:
+            with self.lock:
+                if os.path.exists(self.filepath) and os.path.getsize(self.filepath) > MAX_RUNTIME_LOG_BYTES:
+                    backup_path = self.filepath + ".old"
+                    try:
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                        os.rename(self.filepath, backup_path)
+                    except Exception:
+                        pass
+
+                with open(self.filepath, "a", encoding="utf-8", errors="replace") as f:
+                    lines = message.split('\n')
+                    for idx, line in enumerate(lines):
+                        if idx > 0:
+                            f.write('\n')
+                            self._at_start_of_line = True
+                        if line:
+                            if self._at_start_of_line:
+                                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                prefix = f"[{ts}] "
+                                if self.stream_name == "STDERR":
+                                    prefix = f"[{ts}] [STDERR] "
+                                f.write(prefix)
+                                self._at_start_of_line = False
+                            f.write(line)
+                    f.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            if self.original_stream:
+                self.original_stream.flush()
+        except Exception:
+            pass
+
+    def fileno(self):
+        if hasattr(self.original_stream, "fileno"):
+            return self.original_stream.fileno()
+        raise io.UnsupportedOperation("fileno")
+
+    def isatty(self):
+        if hasattr(self.original_stream, "isatty"):
+            try:
+                return self.original_stream.isatty()
+            except Exception:
+                pass
+        return False
+
+    def reconfigure(self, **kwargs):
+        if hasattr(self.original_stream, "reconfigure"):
+            try:
+                self.original_stream.reconfigure(**kwargs)
+            except Exception:
+                pass
+
+    @property
+    def encoding(self):
+        return getattr(self.original_stream, 'encoding', 'utf-8')
+
+# Install dual logger immediately so all prints and startup diagnostics are saved
+if not isinstance(sys.stdout, DualTerminalLogger):
+    sys.stdout = DualTerminalLogger(RUNTIME_LOG_FILE, sys.stdout, "STDOUT")
+if not isinstance(sys.stderr, DualTerminalLogger):
+    sys.stderr = DualTerminalLogger(RUNTIME_LOG_FILE, sys.stderr, "STDERR")
+
+print(f"=== QC SUITE RUNTIME LOG SESSION INITIALIZED AT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+
 import config
 from search_engine import ImageSearchEngine
 from image_processor import ImageProcessor
@@ -2749,11 +2844,14 @@ class ModuleReviewTab(tk.Frame):
             pass
 
     def query_pre_el(self, sn, session_dt):
+        t_start_all = time.time()
         pre_stations = [f"{config.PRE_EL_STATION_PREFIX}{i}" for i in range(config.PRE_EL_STATION_MIN, config.PRE_EL_STATION_MAX + 1)]
         
         # 1. Before getting time and station, check if MES has layup time for this SN
         # Enables automatic detection of modules produced in prior months (e.g. 2am 8/14 -> window 8/13 to 8/15)
+        t0 = time.time()
         mes_dt, mes_station, mes_data = get_mes_layup_time_for_sn(sn)
+        t_mes = time.time() - t0
 
         if mes_dt:
             # Search time frame based on day-1 to day+1 around actual production date
@@ -2768,11 +2866,14 @@ class ModuleReviewTab(tk.Frame):
 
         target_stations = get_pre_el_stations_for_layup_station(mes_station, pre_stations)
 
+        t1 = time.time()
         try:
             results, _ = self.app.search_engine.search_pre_el(sn, target_stations, start_search, end_search, layup_dt=mes_dt, max_results=100)
         except Exception as e:
             print(f"[PRE-EL SEARCH ENGINE ERROR]: {e}")
             results = []
+        t_scan = time.time() - t1
+        print(f"[PRE-EL TOTAL TIMING]: SN '{sn}' query completed in {time.time() - t_start_all:.3f}s (MES: {t_mes:.3f}s, SMB Scan: {t_scan:.3f}s)")
 
         pre_el_views = {
             'front': None,
@@ -4343,6 +4444,7 @@ class AOIDashboardApp:
         ModernButton(top_bar, text="+ MES Process Log", command=self.add_mes_log_tab, primary=False, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
         ModernButton(top_bar, text="🇨🇳 Chinese MES Guide", command=self.open_chinese_mes_guide, primary=False, padx=8, pady=3).pack(side=tk.LEFT)
         ModernButton(top_bar, text="Close Tab", command=self.close_current_tab, primary=False, padx=10, pady=3).pack(side=tk.RIGHT)
+        ModernButton(top_bar, text="📄 View Log", command=self.open_runtime_log, primary=False, padx=10, pady=3).pack(side=tk.RIGHT, padx=(0, 6))
 
         self.main_notebook = ttk.Notebook(self.content)
         self.main_notebook.pack(fill=tk.BOTH, expand=True)
@@ -4390,6 +4492,22 @@ class AOIDashboardApp:
 
     def open_chinese_mes_guide(self):
         MESChineseFieldGuideDialog(self.root)
+
+    def open_runtime_log(self):
+        log_path = RUNTIME_LOG_FILE
+        if not os.path.exists(log_path):
+            try:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] Runtime log file initialized.\n")
+            except Exception:
+                pass
+        try:
+            os.startfile(log_path)
+        except Exception:
+            try:
+                subprocess.Popen(["notepad.exe", log_path])
+            except Exception as e:
+                messagebox.showerror("View Log Error", f"Could not open log file:\n{log_path}\n\nError: {e}")
 
     def close_current_tab(self):
         current_id = self.main_notebook.select()
@@ -4624,15 +4742,23 @@ class AOIDashboardApp:
             if not sn: continue
             self.root.after(0, lambda i=idx, s=sn: self._update_overall_progress(tab, i + 1, total_sns, s))
             sn_start, sn_end = start, end
+            t_sn_start = time.time()
             if tab.mode == "PRE_EL":
+                t0 = time.time()
                 mes_dt, mes_station, _ = get_mes_layup_time_for_sn(sn)
+                t_mes = time.time() - t0
                 target_stations = get_pre_el_stations_for_layup_station(mes_station, stations_list)
                 if mes_dt and (mes_dt < start or mes_dt > end):
                     sn_start = mes_dt.replace(hour=0, minute=0, second=0) - timedelta(days=1)
                     sn_end = mes_dt.replace(hour=23, minute=59, second=59) + timedelta(days=1)
+                t1 = time.time()
                 res, _ = self.search_engine.search_pre_el(sn, target_stations, sn_start, sn_end, layup_dt=mes_dt, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
+                t_scan = time.time() - t1
+                print(f"[BATCH TIMING]: Pre-EL SN '{sn}' completed in {time.time() - t_sn_start:.3f}s (MES: {t_mes:.3f}s, File Scan: {t_scan:.3f}s)")
             else:
+                t1 = time.time()
                 res, _ = self.search_engine.search_final_el(sn, stations_list, start, end, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
+                print(f"[BATCH TIMING]: {tab.mode} SN '{sn}' completed in {time.time() - t1:.3f}s")
             all_results[sn] = res
         self.root.after(0, lambda: self._display_results(tab, all_results, search_id))
 

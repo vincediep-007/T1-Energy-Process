@@ -143,6 +143,7 @@ class ImageSearchEngine:
     def search_pre_el(self, serial_number: str, stations_list: List[str], 
                       start_date: datetime, end_date: datetime, 
                       layup_dt: Optional[datetime] = None, max_results: int = 100) -> Tuple[List[Dict], bool]:
+        t0 = time.time()
         self.cancel_flag.clear()
 
         # 1. If layup_dt is provided, pinpoint directly to Chinese 8am shift folders
@@ -152,8 +153,11 @@ class ImageSearchEngine:
                 pinpointed_paths = get_pinpointed_pre_el_paths(layup_dt, stations_list)
                 if pinpointed_paths:
                     print(f"[PRE-EL PINPOINT SEARCH]: SN '{serial_number}' targeting {len(pinpointed_paths)} shift directories based on Layup Time {layup_dt}...")
-                    results, is_truncated = self._execute_pool(pinpointed_paths, serial_number, self.search_pre_el_path, max_results)
+                    results, is_truncated = self._execute_pool(pinpointed_paths, serial_number, self.search_pre_el_path, max_results, early_stop_on_found=bool(serial_number))
                     if results:
+                        t_tot = time.time() - t0
+                        st_list = list({r.get('station', '') for r in results if r.get('station')})
+                        print(f"[PRE-EL TIMING]: SN '{serial_number}' pinpoint scan found {len(results)} image(s) in {st_list} in {t_tot:.3f}s")
                         return results, is_truncated
                     print(f"[PRE-EL PINPOINT NOTICE]: No images in pinpointed shift folders, falling back to standard date range...")
             except Exception as pin_err:
@@ -162,7 +166,10 @@ class ImageSearchEngine:
         # 2. Standard Date Range fallback if layup_dt is None or pinpointed shift folder had no files
         date_folders = self.get_pre_el_date_folders(start_date, end_date)
         search_paths = [(os.path.join(config.PRE_EL_NETWORK_ROOT, st, df), st) for st in stations_list for df in date_folders]
-        return self._execute_pool(search_paths, serial_number, self.search_pre_el_path, max_results)
+        results, is_truncated = self._execute_pool(search_paths, serial_number, self.search_pre_el_path, max_results)
+        t_tot = time.time() - t0
+        print(f"[PRE-EL TIMING]: SN '{serial_number}' standard date range scan ({len(search_paths)} paths) finished in {t_tot:.3f}s ({len(results)} image(s))")
+        return results, is_truncated
 
     # ================== FINAL EL & STRING BLACK ==================
     def _parse_final_el_time(self, filename: str, file_date: datetime) -> datetime:
@@ -282,7 +289,7 @@ class ImageSearchEngine:
         return self._execute_pool(search_paths, serial_number, worker, max_results)
 
     # ================== THREAD POOL ==================
-    def _execute_pool(self, search_paths, serial_number, scan_func, max_results):
+    def _execute_pool(self, search_paths, serial_number, scan_func, max_results, early_stop_on_found: bool = False):
         total_paths = len(search_paths)
         if total_paths == 0: return [], False
 
@@ -291,29 +298,39 @@ class ImageSearchEngine:
         exceeded_limit = False
         max_workers = min(14, total_paths)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_path = {executor.submit(scan_func, path, serial_number, st): path 
-                              for path, st in search_paths}
-            
-            for future in as_completed(future_to_path):
-                if self.cancel_flag.is_set():
-                    for f in future_to_path: f.cancel()
-                    break
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_info = {executor.submit(scan_func, path, serial_number, st): (path, st) 
+                                  for path, st in search_paths}
                 
-                completed += 1
-                try:
-                    results = future.result()
-                    all_results.extend(results)
-                    if max_results > 0 and len(all_results) > max_results:
-                        exceeded_limit = True
-                        self.cancel_flag.set()
-                        for f in future_to_path: f.cancel()
+                for future in as_completed(future_to_info):
+                    if self.cancel_flag.is_set():
+                        for f in future_to_info: f.cancel()
                         break
+                    
+                    completed += 1
+                    try:
+                        results = future.result()
+                        if results:
+                            all_results.extend(results)
+                            if early_stop_on_found and serial_number:
+                                _, st_done = future_to_info[future]
+                                print(f"[SEARCH EARLY HIT]: Found {len(results)} image(s) in {st_done}. Skipping remaining {total_paths - completed} pending directories.")
+                                for f in future_to_info: f.cancel()
+                                break
 
-                    pct = int((completed / total_paths) * 100)
-                    tag = serial_number if serial_number else "Scanning"
-                    self._report_progress(completed, total_paths, f"{tag}... {pct}%")
-                except: pass
+                        if max_results > 0 and len(all_results) > max_results:
+                            exceeded_limit = True
+                            self.cancel_flag.set()
+                            for f in future_to_info: f.cancel()
+                            break
+
+                        pct = int((completed / total_paths) * 100)
+                        tag = serial_number if serial_number else "Scanning"
+                        self._report_progress(completed, total_paths, f"{tag}... {pct}%")
+                    except: pass
+        finally:
+            self.cancel_flag.clear()
 
         # Deduplicate results by normalized file path
         unique_results = []
