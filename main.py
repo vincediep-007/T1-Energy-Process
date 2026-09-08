@@ -960,7 +960,8 @@ class MESProcessLogTab(tk.Frame):
         self.ent_query_sn.pack(side=tk.LEFT, padx=(0, 6))
         self.ent_query_sn.bind("<Return>", lambda e: self.query_sn())
 
-        ModernButton(q_frame, text="Search & Query", command=self.query_sn, primary=True, padx=8, pady=2).pack(side=tk.LEFT, padx=(0, 8))
+        ModernButton(q_frame, text="Search & Query", command=self.query_sn, primary=True, padx=8, pady=2).pack(side=tk.LEFT, padx=(0, 4))
+        ModernButton(q_frame, text="Clear", command=self.clear_query_sn, primary=False, padx=6, pady=2).pack(side=tk.LEFT, padx=(0, 6))
         self.lbl_query_status = tk.Label(q_frame, text="Ready", font=("Segoe UI", 9), bg="white", fg="#64748b")
         self.lbl_query_status.pack(side=tk.LEFT)
 
@@ -973,9 +974,10 @@ class MESProcessLogTab(tk.Frame):
         self.ent_filter.pack(side=tk.LEFT, padx=(0, 6))
         self.ent_filter.bind("<KeyRelease>", lambda e: self.on_filter_changed())
 
-        ModernButton(f_frame, text="Clear", command=self.clear_filter, primary=False, padx=6, pady=2).pack(side=tk.LEFT, padx=(0, 8))
+        ModernButton(f_frame, text="Clear Filter", command=self.clear_filter, primary=False, padx=6, pady=2).pack(side=tk.LEFT, padx=(0, 6))
         self.lbl_count_tag = tk.Label(f_frame, text="Showing: 0 / 0", font=("Segoe UI", 9, "bold"), bg="white", fg=config.COLOR_PRIMARY)
-        self.lbl_count_tag.pack(side=tk.LEFT)
+        self.lbl_count_tag.pack(side=tk.LEFT, padx=(0, 8))
+        ModernButton(f_frame, text="🗑️ Clear Log", command=self.clear_log, primary=False, padx=6, pady=2).pack(side=tk.LEFT)
 
         # 4. Table Container with ttk.Treeview
         table_container = tk.Frame(self, bg="white", highlightbackground=config.COLOR_DIVIDER, highlightthickness=1)
@@ -1095,9 +1097,16 @@ class MESProcessLogTab(tk.Frame):
     def on_filter_changed(self, event=None):
         self.apply_filter()
 
+    def clear_query_sn(self):
+        self.ent_query_sn.delete(0, tk.END)
+        self.lbl_query_status.config(text="Ready", fg="#64748b")
+        self.ent_query_sn.focus_set()
+
     def clear_filter(self):
         self.ent_filter.delete(0, tk.END)
         self.apply_filter()
+        self.lbl_query_status.config(text="Filter cleared", fg="#64748b")
+        self.ent_filter.focus_set()
 
     def open_archive_log(self):
         archive_file = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend_archive.json")
@@ -1314,17 +1323,74 @@ class MESProcessLogTab(tk.Frame):
                 messagebox.showerror("Export Failed", f"Could not write CSV file:\n{e}")
 
     def clear_log(self):
-        if not self.records:
-            messagebox.showinfo("Log Empty", "MES Process Log is already empty.")
-            return
-        if messagebox.askyesno("Clear MES Log", "Are you sure you want to clear all MES Process Log entries?\nThis will permanently reset the trend log file."):
+        has_items = bool(self.records) or bool(self.tree.get_children())
+        if not has_items and os.path.exists(MES_TREND_FILE):
             try:
-                with open(MES_TREND_FILE, 'w', encoding='utf-8') as f:
-                    json.dump([], f, ensure_ascii=False, indent=2)
+                with open(MES_TREND_FILE, 'r', encoding='utf-8') as f:
+                    has_items = bool(json.load(f))
+            except Exception:
+                pass
+
+        if not has_items:
+            messagebox.showinfo("Log Empty", "MES Process Log is already empty.", parent=self)
+            return
+
+        if not messagebox.askyesno("Clear MES Log", "Are you sure you want to clear all MES Process Log entries?\n\nThis will safely archive existing records and clear the table.", parent=self):
+            return
+
+        # 1. Archive records safely so nothing is lost
+        records_to_archive = list(self.records)
+        if not records_to_archive and os.path.exists(MES_TREND_FILE):
+            try:
+                with open(MES_TREND_FILE, 'r', encoding='utf-8') as f:
+                    records_to_archive = json.load(f)
+            except Exception:
+                records_to_archive = []
+
+        if records_to_archive:
+            try:
+                archive_file = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend_archive.json")
+                archived = []
+                if os.path.exists(archive_file):
+                    try:
+                        with open(archive_file, 'r', encoding='utf-8') as af:
+                            archived = json.load(af)
+                    except Exception:
+                        archived = []
+                existing_sns = {r.get('sn') for r in archived if r.get('sn')}
+                for r in records_to_archive:
+                    if r.get('sn') and r.get('sn') not in existing_sns:
+                        archived.append(r)
+                with open(archive_file, 'w', encoding='utf-8') as af:
+                    json.dump(archived, af, ensure_ascii=False, indent=2, default=str)
+                print(f"[CLEAR LOG]: Safely archived {len(records_to_archive)} records.")
             except Exception as e:
-                print(f"Clear log error: {e}")
-            self.load_records()
-            self.lbl_query_status.config(text="Log cleared", fg="#64748b")
+                print(f"[CLEAR LOG ARCHIVE ERROR]: {e}")
+
+        # 2. Reset file on disk
+        try:
+            with open(MES_TREND_FILE, 'w', encoding='utf-8') as f:
+                json.dump([], f, ensure_ascii=False, indent=2)
+            self.last_trend_mtime = os.path.getmtime(MES_TREND_FILE)
+        except Exception as e:
+            print(f"Clear log error: {e}")
+
+        # 3. Directly clear in-memory lists and treeview
+        self.records.clear()
+        self.filtered_records.clear()
+        for row_id in self.tree.get_children():
+            self.tree.delete(row_id)
+
+        # 4. Clear input boxes
+        if hasattr(self, 'ent_query_sn'):
+            self.ent_query_sn.delete(0, tk.END)
+        if hasattr(self, 'ent_filter'):
+            self.ent_filter.delete(0, tk.END)
+
+        # 5. Update KPI cards and counters
+        self.lbl_count_tag.config(text="Showing: 0 / 0")
+        self.update_kpi_cards()
+        self.lbl_query_status.config(text="Log cleared (Records archived safely)", fg="#059669")
 
     def open_mes_portal(self):
         base_tab_url = "http://10.200.3.109:8080/webroot/decision/v10/entry/access/416090fb-b706-40e8-9e4d-d698a059f6bf?preview=true"
@@ -4466,7 +4532,7 @@ class AOIDashboardApp:
             needs_reset = True
         else:
             # Check if active MES trend log has older records from a previous date
-            mes_trend_file = os.path.join(config.LOCAL_DATA_DIR, "mes_process_trend.json")
+            mes_trend_file = MES_TREND_FILE
             if os.path.exists(mes_trend_file):
                 try:
                     with open(mes_trend_file, 'r', encoding='utf-8') as f:
