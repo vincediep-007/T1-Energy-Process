@@ -167,6 +167,9 @@ REVIEW_TABLE_COL_WIDTHS = {
 
 SETTINGS_FILE = os.path.join(LOCAL_DATA_DIR, "persistent_settings.json")
 HISTORY_FILE = os.path.join(LOCAL_DATA_DIR, "history_records.json")
+PRE_EL_HISTORY_FILE = os.path.join(LOCAL_DATA_DIR, "pre_el_search_history.json")
+MR_RECORDS_FILE = os.path.join(LOCAL_DATA_DIR, "module_review_history.json")
+MES_TREND_FILE = os.path.join(LOCAL_DATA_DIR, "mes_process_trend_log.json")
 
 def save_persistent_settings():
     try:

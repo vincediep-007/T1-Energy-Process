@@ -1829,18 +1829,26 @@ def save_mes_trend_entry(entry: dict) -> list:
     return logs
 
 
+MES_LAYUP_LOOKUP_CACHE = {}
+
 def get_mes_layup_time_for_sn(sn: str) -> tuple:
     """
     Retrieves the Layup Time (as a datetime object) and Layup Station from MES for a given module SN.
-    1. Looks in local persistent MES log (mes_process_trend_log.json).
-    2. If not found or missing layup_time, queries MES platform directly via query_mes_process_log(sn).
+    1. Looks in fast in-memory lookup cache (0 ms).
+    2. Looks in local persistent MES log (mes_process_trend_log.json, read-only without modifying).
+    3. If not found or missing layup_time, queries MES platform directly via query_mes_process_log(sn, record_to_trend=False).
+       (Strict Tab Isolation: Prevents PreEL & MR SN searches from polluting MES Process Log tab).
     Returns (layup_datetime, station_string, mes_record_dict).
     """
     clean_sn = clean_and_validate_sn(sn) or (normalize_v01_candidate(sn) if sn else "") or (sn.strip().upper() if sn else "")
     if not clean_sn:
         return None, "", {}
 
-    # Check local cache first
+    # 1. Check in-memory lookup cache first (0 ms)
+    if clean_sn in MES_LAYUP_LOOKUP_CACHE:
+        return MES_LAYUP_LOOKUP_CACHE[clean_sn]
+
+    # 2. Check local persistent MES log (read-only)
     try:
         logs = load_mes_trend_log()
         for r in logs:
@@ -1849,19 +1857,24 @@ def get_mes_layup_time_for_sn(sn: str) -> tuple:
                 if lt_str:
                     dt = parse_mes_datetime(lt_str)
                     if dt:
-                        return dt, r.get('tumlayup', ''), r
+                        res_val = (dt, r.get('tumlayup', '') or r.get('station', ''), r)
+                        MES_LAYUP_LOOKUP_CACHE[clean_sn] = res_val
+                        return res_val
     except Exception as e:
         print(f"[MES CACHE LOOKUP ERROR]: {e}")
 
-    # Not found in local cache: query MES directly and record to trend log so all tabs stay synced
+    # 3. Query MES directly WITHOUT writing to MES trend log (maintains strict tab isolation)
     try:
-        res = query_mes_process_log(clean_sn, record_to_trend=True)
+        res = query_mes_process_log(clean_sn, record_to_trend=False)
         if isinstance(res, dict) and res.get('status') == 'ok':
             lt_str = res.get('layup_time') or ""
             if lt_str:
                 dt = parse_mes_datetime(lt_str)
                 if dt:
-                    return dt, res.get('tumlayup', ''), res
+                    st = res.get('tumlayup', '') or res.get('station', '')
+                    res_val = (dt, st, res)
+                    MES_LAYUP_LOOKUP_CACHE[clean_sn] = res_val
+                    return res_val
     except Exception as q_err:
         print(f"[MES DIRECT QUERY ERROR]: {q_err}")
 

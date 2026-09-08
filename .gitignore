@@ -29,6 +29,8 @@ server.pfx
 last_mes_response.html
 mes_process_trend.json
 mes_process_trend_log.json
+pre_el_search_history.json
+module_review_history.json
 StringBlackData_*.json
 
 # OS and IDE files

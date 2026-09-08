@@ -580,3 +580,54 @@ def _sync_via_openpyxl(master_path: str, records: List[Dict]) -> tuple:
     except Exception as e:
         return False, f"Master Sync Error: {e}"
 
+
+def save_pre_el_search_history(sn_list: List[str], all_results: Dict):
+    """
+    Saves Pre-EL search serial numbers and summary to pre_el_search_history.json.
+    Completely separated from Module Review records and MES trend log.
+    """
+    try:
+        data = []
+        if os.path.exists(config.PRE_EL_HISTORY_FILE):
+            try:
+                with open(config.PRE_EL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        data = []
+            except Exception:
+                data = []
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for sn in reversed(sn_list):
+            if not sn: continue
+            data = [d for d in data if d.get('sn') != sn]
+            res_items = all_results.get(sn, [])
+            data.insert(0, {
+                'sn': sn,
+                'searched_at': now_str,
+                'images_found': len(res_items),
+                'status': 'Found' if len(res_items) > 0 else 'Not Found'
+            })
+
+        data = data[:500]
+        with open(config.PRE_EL_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[PRE-EL HISTORY SAVE ERROR]: {e}")
+
+
+def save_module_review_history(records: List[Dict]):
+    """
+    Saves Module Review records to module_review_history.json.
+    Completely separated from Pre-EL search history and MES trend log.
+    """
+    try:
+        clean_records = []
+        for r in records:
+            c = {k: v for k, v in r.items() if not str(k).startswith('_')}
+            clean_records.append(c)
+        with open(config.MR_RECORDS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(clean_records, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[MR HISTORY SAVE ERROR]: {e}")
+

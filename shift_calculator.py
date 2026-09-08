@@ -324,3 +324,33 @@ def get_pinpointed_pre_el_paths(layup_dt, stations_list: list) -> list:
             paths.append((p, st))
 
     return paths
+
+
+def get_pre_el_stations_for_layup_station(station_str: str, available_stations: list) -> list:
+    """
+    Given a station identifier from MES (e.g. TUMCQEL1007, TUMLAYUP1004, or Line 4),
+    prioritizes the matching Pre-EL station(s) at the front of available_stations.
+    """
+    if not station_str or not available_stations:
+        return list(available_stations)
+
+    s = str(station_str).strip().upper()
+    
+    # 1. Direct Pre-EL station match (e.g. TUMCQEL1007)
+    if s in available_stations:
+        return [s] + [st for st in available_stations if st != s]
+
+    # 2. Check if station_str corresponds to a production line
+    line_label = parse_line_from_station(s)
+    if line_label and line_label.startswith("Line "):
+        try:
+            line_num = int(line_label.replace("Line ", "").strip())
+            st_a = f"{config.PRE_EL_STATION_PREFIX}{1000 + 2 * line_num - 1}"
+            st_b = f"{config.PRE_EL_STATION_PREFIX}{1000 + 2 * line_num}"
+            prioritized = [st for st in (st_a, st_b) if st in available_stations]
+            remaining = [st for st in available_stations if st not in prioritized]
+            return prioritized + remaining
+        except Exception:
+            pass
+
+    return list(available_stations)

@@ -33,11 +33,12 @@ if current_dir not in sys.path:
 import config
 from search_engine import ImageSearchEngine
 from image_processor import ImageProcessor
-from data_manager import DataManager, sync_to_master_excel
+from data_manager import DataManager, sync_to_master_excel, save_pre_el_search_history, save_module_review_history
 
 from shift_calculator import (
     get_responsible_shift_and_line, get_evaluation_shift, parse_line_from_station,
-    get_operational_shift_info, get_pre_el_chinese_shift_folder, get_pinpointed_pre_el_paths
+    get_operational_shift_info, get_pre_el_chinese_shift_folder, get_pinpointed_pre_el_paths,
+    get_pre_el_stations_for_layup_station
 )
 from phone_server import (
     start_phone_server, train_voice_pattern, test_mac_mini_relay_connection,
@@ -2743,6 +2744,7 @@ class ModuleReviewTab(tk.Frame):
         try:
             last_rec = self.records[0] if self.records else None
             update_live_hud_state(last_rec=last_rec, all_records=self.records)
+            save_module_review_history(self.records)
         except Exception:
             pass
 
@@ -2764,10 +2766,7 @@ class ModuleReviewTab(tk.Frame):
             end_search = session_dt + timedelta(days=1)
             print(f"[PRE-EL DEFAULT SEARCH]: SN '{sn}' searching default {days_back} days back from {session_dt.strftime('%Y-%m-%d')}")
 
-        if mes_station and mes_station in pre_stations:
-            target_stations = [mes_station] + [s for s in pre_stations if s != mes_station]
-        else:
-            target_stations = pre_stations
+        target_stations = get_pre_el_stations_for_layup_station(mes_station, pre_stations)
 
         try:
             results, _ = self.app.search_engine.search_pre_el(sn, target_stations, start_search, end_search, layup_dt=mes_dt, max_results=100)
@@ -2987,6 +2986,10 @@ class ModuleReviewTab(tk.Frame):
             self.lbl_hearing.config(text=f"New Shift ({shift_label}): Workspace refreshed.", fg=config.COLOR_STATUS_OK)
         if hasattr(self, 'lbl_photo_status'):
             self.lbl_photo_status.config(text=f"Shift Rollover: {shift_label}. Ready.")
+        try:
+            save_module_review_history(self.records)
+        except Exception:
+            pass
 
     def export_styled_excel(self):
         if not self.records:
@@ -4615,15 +4618,15 @@ class AOIDashboardApp:
         if search_id != self.search_id: return
         all_results = {}
         total_sns = len(sn_list)
-        for idx, sn in enumerate(sn_list):
+        for idx, raw_sn in enumerate(sn_list):
             if self.search_engine.cancel_flag.is_set() or search_id != self.search_id: break
+            sn = clean_and_validate_sn(raw_sn) or (raw_sn.strip().upper() if raw_sn else "")
+            if not sn: continue
             self.root.after(0, lambda i=idx, s=sn: self._update_overall_progress(tab, i + 1, total_sns, s))
             sn_start, sn_end = start, end
             if tab.mode == "PRE_EL":
                 mes_dt, mes_station, _ = get_mes_layup_time_for_sn(sn)
-                target_stations = stations_list
-                if mes_station and mes_station in stations_list:
-                    target_stations = [mes_station] + [s for s in stations_list if s != mes_station]
+                target_stations = get_pre_el_stations_for_layup_station(mes_station, stations_list)
                 if mes_dt and (mes_dt < start or mes_dt > end):
                     sn_start = mes_dt.replace(hour=0, minute=0, second=0) - timedelta(days=1)
                     sn_end = mes_dt.replace(hour=23, minute=59, second=59) + timedelta(days=1)
@@ -4656,6 +4659,11 @@ class AOIDashboardApp:
                 tab.btn_export_imgs.config(state="disabled", text="Export Images")
         tab.lbl_summary.config(text=f"Found: {len(found_sns)}/{len(all_results)} SNs ({total_passes} passes • {total_imgs} imgs)")
         tab.sn_list_ordered = found_sns + [sn for sn in all_results if sn not in found_sns]
+        if tab.mode == "PRE_EL":
+            try:
+                save_pre_el_search_history(tab.sn_list_ordered, all_results)
+            except Exception:
+                pass
         self.refresh_sidebar_for_tab(tab)
         if found_sns: tab._show_single_sn_results(found_sns[0])
 
