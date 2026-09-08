@@ -1659,12 +1659,9 @@ def extract_info_from_mes_html(raw_content: str, fallback_sn: str = "") -> dict:
 
     # 6. Current Step & Defect Notes (Bilingual Extraction & Auto-Translation)
     current_step = ""
-    m_step = re.search(r'(?:Current\s*Step|Current\s*Station|当前工序)[:\s"\'=]+([^\r\n<",]+)', text_content, re.IGNORECASE)
+    m_step = re.search(r'(?:Current\s*Step|Current\s*Station|当前工序)[:\s"\'=]+([A-Za-z0-9_\-\u4e00-\u9fff]{1,15})', text_content, re.IGNORECASE)
     if m_step:
-        raw_step = m_step.group(1).strip()
-        raw_step = re.sub(r'\s+(?:划片|焊接|叠焊|敷设|层压|固化检验|装框|接线盒).*$', '', raw_step).strip()
-        trans_step = translate_mes_text(raw_step)
-        current_step = trans_step if trans_step else raw_step
+        current_step = m_step.group(1).strip()
 
     # 7. Lamination Chamber Position
     lam_pos = ""
@@ -1679,7 +1676,20 @@ def extract_info_from_mes_html(raw_content: str, fallback_sn: str = "") -> dict:
 
     found_any = bool(soldering or layup or lamination or layup_time)
 
-    defect_desc = current_step or ("MES Query: Found" if found_any else "-")
+    hold_note = ""
+    m_hold = re.search(r'(?:Defective\s*Description/Location|不良描述/位置)\s+([^\s|]+)', text_content, re.IGNORECASE)
+    if m_hold:
+        raw_hold = m_hold.group(1).strip()
+        if raw_hold and raw_hold not in ("-", "None", "不良位置"):
+            trans_hold = translate_mes_text(raw_hold)
+            hold_note = trans_hold if trans_hold else raw_hold
+
+    if hold_note:
+        defect_desc = f"{current_step}: {hold_note}" if current_step and current_step not in hold_note else hold_note
+    elif current_step:
+        defect_desc = current_step
+    else:
+        defect_desc = "MES Query: Found" if found_any else "-"
 
     parsed_result = {
         "status": "ok" if found_any or sn else "not_found",
@@ -5107,6 +5117,8 @@ async function fetchDashboardStatus() {
           <span class="pill ${r.result === 'Scrap' ? 'pill-scrap' : 'pill-q3'}" style="font-size: 10px; padding: 2px 6px;">${r.result}</span>
         </div>
       `).join('');
+    }
+
     if (data.last_mes && data.last_mes.sn) {
       const mesInput = document.getElementById('mes-sn-input');
       const curVal = (mesInput ? mesInput.value.trim() : '') || currentMESSN || '';
