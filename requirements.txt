@@ -7,3 +7,4 @@ faster-whisper>=1.0.0
 SpeechRecognition>=3.8.0
 pydub>=0.25.0
 static-ffmpeg>=2.5
+cryptography>=41.0.0

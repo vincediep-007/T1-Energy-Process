@@ -22,9 +22,7 @@ backup/
 *.rar
 *.7z
 
-# SSL certificates and private keys (auto-generated at runtime)
-server.crt
-server.key
+# SSL certificates and private keys
 server.pfx
 
 # Diagnostics and runtime floor logs
