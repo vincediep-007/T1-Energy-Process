@@ -3,8 +3,11 @@
 # Day Shift (06:00 - 18:00): A or C
 # Night Shift (18:00 - 06:00): B or D
 
+import os
 import re
 from datetime import datetime, date, timedelta
+from typing import Tuple, List, Dict, Optional
+import config
 
 # Epoch anchor: Sunday Aug 30, 2026 is Day 0 of Week 1 (4-day week for A/B: Sun, Mon, Tue, Wed)
 EPOCH_SUNDAY = date(2026, 8, 30)
@@ -171,3 +174,153 @@ def get_evaluation_shift(dt=None) -> str:
 
     hour = getattr(dt, 'hour', datetime.now().hour)
     return "Day 白" if 6 <= hour < 18 else "Night 夜"
+
+
+def get_operational_shift_info(dt=None) -> dict:
+    """
+    Returns operational shift information for general factory operations:
+      - Day Shift: 06:00 to 18:00 (A and C shift)
+      - Night Shift: 18:00 to 06:00 (B and D shift)
+    Returns dict:
+      {
+         'shift_key': (production_date, is_day_shift),
+         'team': 'A' | 'B' | 'C' | 'D',
+         'type': 'Day' | 'Night',
+         'name': 'A Shift (Day)' | 'B Shift (Night)' | ...,
+         'date': production_date,
+         'is_day': bool
+      }
+    """
+    if dt is None:
+        dt = datetime.now()
+    elif isinstance(dt, str):
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(dt.strip(), fmt)
+                break
+            except Exception:
+                pass
+        dt = parsed if parsed else datetime.now()
+
+    cal_date = dt.date()
+    hour = dt.hour
+    if hour < 6:
+        prod_date = cal_date - timedelta(days=1)
+        is_day = False
+    elif 6 <= hour < 18:
+        prod_date = cal_date
+        is_day = True
+    else:
+        prod_date = cal_date
+        is_day = False
+
+    _, team = get_responsible_shift_and_line(dt, "")
+    shift_type = "Day" if is_day else "Night"
+    team_label = team or ("A" if is_day else "B")
+
+    return {
+        "shift_key": (prod_date, is_day),
+        "team": team_label,
+        "type": shift_type,
+        "name": f"{team_label} Shift ({shift_type})",
+        "date": prod_date,
+        "is_day": is_day
+    }
+
+
+def get_pre_el_chinese_shift_folder(dt) -> Tuple[date, str, str]:
+    """
+    Computes the Chinese factory Pre-EL date and shift folder:
+    - Daily rollover is 8:00 AM (08:00:00).
+    - Day shift ('白班'): 08:00:00 to 19:59:59
+    - Night shift ('夜班'): 20:00:00 to 07:59:59 next morning
+      (00:00:00 to 07:59:59 belongs to yesterday's night shift)
+    Returns: (production_date, shift_folder_name, relative_path)
+    Example:
+      2026-09-07 20:00:04 -> (2026-09-07, '夜班', '2026 Year\\09 Month\\07 Day\\夜班')
+      2026-09-07 09:15:00 -> (2026-09-07, '白班', '2026 Year\\09 Month\\07 Day\\白班')
+      2026-09-07 06:16:43 -> (2026-09-06, '夜班', '2026 Year\\09 Month\\06 Day\\夜班')
+    """
+    if dt is None:
+        dt = datetime.now()
+    elif isinstance(dt, str):
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(dt.strip(), fmt)
+                break
+            except Exception:
+                pass
+        dt = parsed if parsed else datetime.now()
+
+    cal_date = dt.date()
+    hour = dt.hour
+
+    if hour < 8:
+        # Before 8:00 AM belongs to yesterday's night shift (夜班)
+        prod_date = cal_date - timedelta(days=1)
+        shift_name = "夜班"
+    elif 8 <= hour < 20:
+        # 8:00 AM to 7:59:59 PM is today's day shift (白班)
+        prod_date = cal_date
+        shift_name = "白班"
+    else:
+        # 8:00 PM to 11:59:59 PM is today's night shift (夜班)
+        prod_date = cal_date
+        shift_name = "夜班"
+
+    rel_folder = f"{prod_date.year} Year\\{prod_date.month:02d} Month\\{prod_date.day:02d} Day\\{shift_name}"
+    return prod_date, shift_name, rel_folder
+
+
+def get_pinpointed_pre_el_paths(layup_dt, stations_list: list) -> list:
+    """
+    Builds pinpointed search paths for Pre-EL stations based on Layup Time:
+    - Primary pinpointed Chinese shift folder
+    - If layup time is within 45 minutes of a shift transition (08:00 or 20:00),
+      also includes the adjacent shift folder as a fallback.
+    Returns: list of (full_directory_path, station_name)
+    """
+    if not layup_dt:
+        return []
+
+    if isinstance(layup_dt, str):
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(layup_dt.strip(), fmt)
+                break
+            except Exception:
+                pass
+        if not parsed:
+            return []
+        layup_dt = parsed
+
+    # 1. Primary pinpointed folder
+    _, primary_shift, primary_rel = get_pre_el_chinese_shift_folder(layup_dt)
+    target_rel_folders = [primary_rel]
+
+    # 2. Check for transition boundary within 45 minutes of 08:00 or 20:00
+    t_min = layup_dt.hour * 60 + layup_dt.minute
+    # Near 8am (07:15 - 08:45)
+    if 7 * 60 + 15 <= t_min <= 8 * 60 + 45:
+        alt_dt = layup_dt + timedelta(minutes=60 if t_min < 8 * 60 else -60)
+        _, _, alt_rel = get_pre_el_chinese_shift_folder(alt_dt)
+        if alt_rel not in target_rel_folders:
+            target_rel_folders.append(alt_rel)
+    # Near 8pm (19:15 - 20:45)
+    elif 19 * 60 + 15 <= t_min <= 20 * 60 + 45:
+        alt_dt = layup_dt + timedelta(minutes=60 if t_min < 20 * 60 else -60)
+        _, _, alt_rel = get_pre_el_chinese_shift_folder(alt_dt)
+        if alt_rel not in target_rel_folders:
+            target_rel_folders.append(alt_rel)
+
+    # 3. Combine with stations list
+    paths = []
+    for st in stations_list:
+        for rf in target_rel_folders:
+            p = os.path.join(config.PRE_EL_NETWORK_ROOT, st, rf)
+            paths.append((p, st))
+
+    return paths

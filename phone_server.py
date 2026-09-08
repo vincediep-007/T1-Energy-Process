@@ -1853,9 +1853,9 @@ def get_mes_layup_time_for_sn(sn: str) -> tuple:
     except Exception as e:
         print(f"[MES CACHE LOOKUP ERROR]: {e}")
 
-    # Not found in local cache: query MES directly without recording to trend / firing MES tab callback
+    # Not found in local cache: query MES directly and record to trend log so all tabs stay synced
     try:
-        res = query_mes_process_log(clean_sn, record_to_trend=False)
+        res = query_mes_process_log(clean_sn, record_to_trend=True)
         if isinstance(res, dict) and res.get('status') == 'ok':
             lt_str = res.get('layup_time') or ""
             if lt_str:
@@ -2340,7 +2340,9 @@ LIVE_HUD_STATE = {
         "top_defects": [],
         "line_counts": {}
     },
-    "records": []
+    "records": [],
+    "last_mes": {},
+    "shift_reset_ts": 0.0
 }
 
 GLOBAL_OVERRIDE_CALLBACK = None
@@ -2357,7 +2359,7 @@ def get_local_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
-def update_live_hud_state(last_rec=None, live_voice=None, all_records=None, override_callback=None, defect_callback=None, mes_callback=None):
+def update_live_hud_state(last_rec=None, live_voice=None, all_records=None, override_callback=None, defect_callback=None, mes_callback=None, reset_shift: bool = False):
     global LIVE_HUD_STATE, GLOBAL_OVERRIDE_CALLBACK, GLOBAL_DEFECT_CALLBACK, GLOBAL_MES_CALLBACK
     if override_callback is not None:
         GLOBAL_OVERRIDE_CALLBACK = override_callback
@@ -2365,6 +2367,41 @@ def update_live_hud_state(last_rec=None, live_voice=None, all_records=None, over
         GLOBAL_DEFECT_CALLBACK = defect_callback
     if mes_callback is not None:
         GLOBAL_MES_CALLBACK = mes_callback
+
+    if reset_shift:
+        LIVE_HUD_STATE["last_panel"] = {
+            "sn": "-",
+            "order": "-",
+            "summary": "-",
+            "class": "-",
+            "result": "-",
+            "line": "-",
+            "shift": "-",
+            "layup_time": "-",
+            "station": "-",
+            "photo_name": "-",
+            "photo_path": "",
+            "timestamp": "",
+            "status": "Ready"
+        }
+        LIVE_HUD_STATE["last_mes"] = {}
+        LIVE_HUD_STATE["live_voice"] = {
+            "raw_text": "",
+            "defect": "-",
+            "result": "-",
+            "timestamp": ""
+        }
+        LIVE_HUD_STATE["today_stats"] = {
+            "total": 0,
+            "q3": 0,
+            "scrap": 0,
+            "top_defects": [],
+            "line_counts": {f"Line {i}": 0 for i in range(1, 8)}
+        }
+        LIVE_HUD_STATE["records"] = []
+        LIVE_HUD_STATE["shift_reset_ts"] = time.time()
+        print(f"[MOBILE HUD]: Operational Shift Reset applied at {LIVE_HUD_STATE['shift_reset_ts']}")
+        return
 
     if last_rec:
         LIVE_HUD_STATE["last_panel"] = {
@@ -5040,11 +5077,46 @@ function switchTab(tabId) {
   }
 }
 
+let lastKnownShiftResetTs = 0;
+
 async function fetchDashboardStatus() {
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;
     const data = await res.json();
+
+    if (data.shift_reset_ts && data.shift_reset_ts > lastKnownShiftResetTs) {
+      const isInitial = (lastKnownShiftResetTs === 0);
+      lastKnownShiftResetTs = data.shift_reset_ts;
+      if (!isInitial) {
+        currentSN = '';
+        currentMESSN = '';
+        const snEl = document.getElementById('disp-sn');
+        if (snEl) snEl.innerText = 'Pending SN';
+        const mesInput = document.getElementById('mes-sn-input');
+        if (mesInput) mesInput.value = '';
+        const gradeEl = document.getElementById('disp-grade');
+        if (gradeEl) {
+          gradeEl.innerText = '-';
+          gradeEl.style.color = 'var(--text-muted)';
+        }
+        const panelSn = document.getElementById('panel-sn');
+        if (panelSn) panelSn.innerText = 'Ready for Inspection';
+        const panelDef = document.getElementById('panel-defect');
+        if (panelDef) panelDef.innerText = 'Awaiting Scan';
+        const resEl = document.getElementById('panel-result');
+        if (resEl) {
+          resEl.innerText = '-';
+          resEl.className = 'pill pill-q3';
+        }
+        if (typeof resetMESUIState === 'function') {
+          resetMESUIState();
+        }
+        if (typeof showToast === 'function') {
+          showToast('🔄 New shift started! Workspace reset.');
+        }
+      }
+    }
 
     const p = data.last_panel || {};
     if (p.sn && p.sn !== 'Pending SN' && !currentSN) {
@@ -5440,6 +5512,19 @@ function setHighlightBadge(key, text, type) {
   if (card) {
     card.classList.remove('present', 'blank');
   }
+}
+
+function resetMESUIState() {
+  currentMESSN = '';
+  const mesInput = document.getElementById('mes-sn-input');
+  if (mesInput) mesInput.value = '';
+  const badge = document.getElementById('mes-query-badge');
+  if (badge) { badge.innerText = 'Pending SN'; badge.style.color = 'var(--text-muted)'; }
+  setHighlightBadge('soldering', 'PENDING SN', 'pending');
+  setHighlightBadge('layup', 'PENDING SN', 'pending');
+  setHighlightBadge('lamination', 'PENDING SN', 'pending');
+  const extraBox = document.getElementById('mes-extra-details');
+  if (extraBox) extraBox.style.display = 'none';
 }
 
 function openMESReportDirect() {

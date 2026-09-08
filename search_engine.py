@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from PIL import Image
 import config
 
@@ -141,8 +141,25 @@ class ImageSearchEngine:
         return results
 
     def search_pre_el(self, serial_number: str, stations_list: List[str], 
-                      start_date: datetime, end_date: datetime, max_results: int = 100) -> Tuple[List[Dict], bool]:
+                      start_date: datetime, end_date: datetime, 
+                      layup_dt: Optional[datetime] = None, max_results: int = 100) -> Tuple[List[Dict], bool]:
         self.cancel_flag.clear()
+
+        # 1. If layup_dt is provided, pinpoint directly to Chinese 8am shift folders
+        if layup_dt:
+            try:
+                from shift_calculator import get_pinpointed_pre_el_paths
+                pinpointed_paths = get_pinpointed_pre_el_paths(layup_dt, stations_list)
+                if pinpointed_paths:
+                    print(f"[PRE-EL PINPOINT SEARCH]: SN '{serial_number}' targeting {len(pinpointed_paths)} shift directories based on Layup Time {layup_dt}...")
+                    results, is_truncated = self._execute_pool(pinpointed_paths, serial_number, self.search_pre_el_path, max_results)
+                    if results:
+                        return results, is_truncated
+                    print(f"[PRE-EL PINPOINT NOTICE]: No images in pinpointed shift folders, falling back to standard date range...")
+            except Exception as pin_err:
+                print(f"[PRE-EL PINPOINT ERROR]: {pin_err}")
+
+        # 2. Standard Date Range fallback if layup_dt is None or pinpointed shift folder had no files
         date_folders = self.get_pre_el_date_folders(start_date, end_date)
         search_paths = [(os.path.join(config.PRE_EL_NETWORK_ROOT, st, df), st) for st in stations_list for df in date_folders]
         return self._execute_pool(search_paths, serial_number, self.search_pre_el_path, max_results)

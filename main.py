@@ -35,7 +35,10 @@ from search_engine import ImageSearchEngine
 from image_processor import ImageProcessor
 from data_manager import DataManager, sync_to_master_excel
 
-from shift_calculator import get_responsible_shift_and_line, get_evaluation_shift, parse_line_from_station
+from shift_calculator import (
+    get_responsible_shift_and_line, get_evaluation_shift, parse_line_from_station,
+    get_operational_shift_info, get_pre_el_chinese_shift_folder, get_pinpointed_pre_el_paths
+)
 from phone_server import (
     start_phone_server, train_voice_pattern, test_mac_mini_relay_connection,
     get_file_datetime, refresh_save_folders_for_today, update_live_hud_state,
@@ -309,6 +312,9 @@ class Top5AnalyticsTab(tk.Frame):
         self.canvas_area.configure(yscrollcommand=scrollbar.set)
         self.canvas_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.render_charts()
+
+    def reset_for_new_shift(self, shift_info=None):
         self.render_charts()
 
     def render_charts(self):
@@ -994,6 +1000,16 @@ class MESProcessLogTab(tk.Frame):
     def clear_filter(self):
         self.ent_filter.delete(0, tk.END)
         self.apply_filter()
+
+    def reset_for_new_shift(self, shift_info=None):
+        if hasattr(self, 'ent_query_sn'):
+            self.ent_query_sn.delete(0, tk.END)
+        if hasattr(self, 'ent_filter'):
+            self.ent_filter.delete(0, tk.END)
+        self.apply_filter()
+        shift_label = shift_info.get('name', 'New Shift') if shift_info else 'New Shift'
+        if hasattr(self, 'lbl_query_status'):
+            self.lbl_query_status.config(text=f"Shift Rollover: {shift_label}", fg="#2563eb")
 
     def apply_filter(self):
         query = self.ent_filter.get().strip().lower()
@@ -2748,8 +2764,13 @@ class ModuleReviewTab(tk.Frame):
             end_search = session_dt + timedelta(days=1)
             print(f"[PRE-EL DEFAULT SEARCH]: SN '{sn}' searching default {days_back} days back from {session_dt.strftime('%Y-%m-%d')}")
 
+        if mes_station and mes_station in pre_stations:
+            target_stations = [mes_station] + [s for s in pre_stations if s != mes_station]
+        else:
+            target_stations = pre_stations
+
         try:
-            results, _ = self.app.search_engine.search_pre_el(sn, pre_stations, start_search, end_search, max_results=100)
+            results, _ = self.app.search_engine.search_pre_el(sn, target_stations, start_search, end_search, layup_dt=mes_dt, max_results=100)
         except Exception as e:
             print(f"[PRE-EL SEARCH ENGINE ERROR]: {e}")
             results = []
@@ -2938,6 +2959,34 @@ class ModuleReviewTab(tk.Frame):
             self.app.global_review_records = []
             for w in self.rows_frame.winfo_children(): w.destroy()
             self.lbl_table_count.config(text="Total Records Reviewed: 0")
+
+    def reset_for_new_shift(self, shift_info=None):
+        if hasattr(self, 'ent_sn'):
+            self.ent_sn.delete(0, tk.END)
+        if hasattr(self, 'cb_class'):
+            self.cb_class.set("")
+        if hasattr(self, 'cb_summary'):
+            self.cb_summary.set("")
+        if hasattr(self, 'cb_result'):
+            self.cb_result.set("")
+        if hasattr(self, 'cb_line'):
+            self.cb_line.set("")
+        if hasattr(self, 'cb_cause'):
+            self.cb_cause.set("")
+        self.active_photo_path = None
+        self.selected_rec_id = None
+        self.records.clear()
+        self.app.global_review_records = []
+        if hasattr(self, 'rows_frame'):
+            for w in self.rows_frame.winfo_children():
+                w.destroy()
+        if hasattr(self, 'lbl_table_count'):
+            self.lbl_table_count.config(text="Total Records Reviewed: 0")
+        shift_label = shift_info.get('name', 'New Shift') if shift_info else 'New Shift'
+        if hasattr(self, 'lbl_hearing'):
+            self.lbl_hearing.config(text=f"New Shift ({shift_label}): Workspace refreshed.", fg=config.COLOR_STATUS_OK)
+        if hasattr(self, 'lbl_photo_status'):
+            self.lbl_photo_status.config(text=f"Shift Rollover: {shift_label}. Ready.")
 
     def export_styled_excel(self):
         if not self.records:
@@ -3567,6 +3616,28 @@ class TabContent(tk.Frame):
             self.cb_timeslot.set(get_current_shift_slot(slots))
             self.render_string_black_dashboard()
 
+    def reset_for_new_shift(self, shift_info=None):
+        if hasattr(self, 'txt_sn'):
+            self.txt_sn.delete("1.0", tk.END)
+        self.current_results.clear()
+        self.raw_ng_images.clear()
+        self.sn_list_ordered.clear()
+        if hasattr(self, 'lbl_summary'):
+            shift_label = shift_info.get('name', 'New Shift') if shift_info else 'New Shift'
+            self.lbl_summary.config(text=f"Shift Rollover: {shift_label}")
+        if hasattr(self, 'btn_export'):
+            self.btn_export.config(state="disabled", text="Export Excel")
+        if hasattr(self, 'btn_export_imgs'):
+            self.btn_export_imgs.config(state="disabled", text="Export Images")
+        if hasattr(self, 'result_container'):
+            for w in self.result_container.winfo_children():
+                w.destroy()
+        if self.mode == "STRING_BLACK" and hasattr(self, 'cb_timeslot'):
+            slots = generate_shift_time_slots(getattr(config, 'DEFAULT_TIME_INTERVAL', '2 Hours'))
+            self.cb_timeslot['values'] = slots
+            self.cb_timeslot.set(get_current_shift_slot(slots))
+            self.render_string_black_dashboard()
+
     def toggle_search(self):
         if self.app.is_searching: self.app.stop_search()
         else: self.app.start_search_for_tab(self)
@@ -4088,6 +4159,8 @@ class AOIDashboardApp:
         self.active_tab = None
         self.tab_counters = {"PRE_EL": 0, "FINAL_EL": 0, "STRING_BLACK": 0}
         self.current_app_date = datetime.now().date()
+        self.current_shift_info = get_operational_shift_info()
+        self.current_shift_key = self.current_shift_info['shift_key']
         self.incoming_event_queue = queue.Queue()
         self.setup_styles()
         self.setup_layout()
@@ -4103,7 +4176,7 @@ class AOIDashboardApp:
                     tab.lbl_server_url.config(text=self.phone_server_url)
                 if hasattr(tab, 'update_qr_code'):
                     tab.update_qr_code(self.phone_server_url)
-        self.check_midnight_rollover()
+        self.check_shift_and_day_rollover()
         self._poll_incoming_events()
 
     def on_mes_record_logged(self, data):
@@ -4162,24 +4235,64 @@ class AOIDashboardApp:
             except Exception:
                 pass
 
-    def check_midnight_rollover(self):
-        today = datetime.now().date()
+    def get_current_tab(self):
+        try:
+            current_id = self.main_notebook.select()
+            if current_id:
+                return self.main_notebook.nametowidget(current_id)
+        except Exception:
+            pass
+        return None
+
+    def check_shift_and_day_rollover(self):
+        now = datetime.now()
+        today = now.date()
+        shift_info = get_operational_shift_info(now)
+        shift_key = shift_info['shift_key']
+
+        # 1. Calendar Day Rollover check (refresh save folders)
         if today != self.current_app_date:
             self.current_app_date = today
-            print(f"[APP MIDNIGHT ROLLOVER]: Day changed to {today}. Refreshing save folders and clearing previous day records.")
+            print(f"[APP DATE ROLLOVER]: Day changed to {today}. Refreshing save folders.")
             refresh_save_folders_for_today()
-            for tab in self.all_tabs:
-                if isinstance(tab, ModuleReviewTab):
-                    tab.records.clear()
-                    tab.refresh_treeview()
-                    tab.lbl_hearing.config(text=f"New Day ({today.strftime('%m/%d/%Y')}): Workspace refreshed.", fg=config.COLOR_STATUS_OK)
-                elif isinstance(tab, TabContent):
-                    if hasattr(tab, 'date_from_val'):
-                        tab.date_from_val['date'] = datetime.now()
-                    if hasattr(tab, 'date_to_val'):
-                        tab.date_to_val['date'] = datetime.now()
-        # Check every 30 seconds
-        self.root.after(30000, self.check_midnight_rollover)
+
+        # 2. Operational Shift Rollover check (6:00 AM & 6:00 PM)
+        if shift_key != self.current_shift_key:
+            prev_shift = self.current_shift_info.get('name', 'Previous Shift')
+            self.current_shift_info = shift_info
+            self.current_shift_key = shift_key
+            print(f"[APP SHIFT ROLLOVER]: Operational shift changed from {prev_shift} to {shift_info['name']} (Key: {shift_key}). Resetting scanning & workspaces across all tabs...")
+            self.on_operational_shift_changed(shift_info)
+
+        # Check every 15 seconds
+        self.root.after(15000, self.check_shift_and_day_rollover)
+
+    def on_operational_shift_changed(self, shift_info):
+        # 1. Reset all tabs
+        for tab in self.all_tabs:
+            if hasattr(tab, 'reset_for_new_shift'):
+                try:
+                    tab.reset_for_new_shift(shift_info)
+                except Exception as e:
+                    print(f"[SHIFT RESET TAB ERROR]: {e}")
+
+        # 2. Clear sidebar SN navigation list
+        try:
+            curr_tab = self.get_current_tab()
+            if curr_tab:
+                self.refresh_sidebar_for_tab(curr_tab)
+            else:
+                for w in self.sidebar_nav_content.winfo_children():
+                    w.destroy()
+                self.lbl_sn_nav_title.config(text="Serial Numbers (0)")
+        except Exception as e:
+            print(f"[SHIFT RESET SIDEBAR ERROR]: {e}")
+
+        # 3. Trigger phone server live HUD reset
+        try:
+            update_live_hud_state(reset_shift=True)
+        except Exception as e:
+            print(f"[SHIFT RESET HUD ERROR]: {e}")
 
     def setup_styles(self):
         style = ttk.Style()
@@ -4507,11 +4620,14 @@ class AOIDashboardApp:
             self.root.after(0, lambda i=idx, s=sn: self._update_overall_progress(tab, i + 1, total_sns, s))
             sn_start, sn_end = start, end
             if tab.mode == "PRE_EL":
-                mes_dt, _, _ = get_mes_layup_time_for_sn(sn)
+                mes_dt, mes_station, _ = get_mes_layup_time_for_sn(sn)
+                target_stations = stations_list
+                if mes_station and mes_station in stations_list:
+                    target_stations = [mes_station] + [s for s in stations_list if s != mes_station]
                 if mes_dt and (mes_dt < start or mes_dt > end):
                     sn_start = mes_dt.replace(hour=0, minute=0, second=0) - timedelta(days=1)
                     sn_end = mes_dt.replace(hour=23, minute=59, second=59) + timedelta(days=1)
-                res, _ = self.search_engine.search_pre_el(sn, stations_list, sn_start, sn_end, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
+                res, _ = self.search_engine.search_pre_el(sn, target_stations, sn_start, sn_end, layup_dt=mes_dt, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
             else:
                 res, _ = self.search_engine.search_final_el(sn, stations_list, start, end, max_results=getattr(config, 'MAX_IMAGES_PER_SN', 0))
             all_results[sn] = res
